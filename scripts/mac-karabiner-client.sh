@@ -42,7 +42,8 @@ echo "Leave this terminal open. Stop with Ctrl+C."
 sudo env \
   RUST_LOG="${RUST_LOG:-softkvm=info,softkvm::latency=warn}" \
   SOFTKVM_MAC_MODIFIER_POLICY="${SOFTKVM_MAC_MODIFIER_POLICY:-swap-alt-super}" \
-  SOFTKVM_CGEVENT_POINTER_SPEED="${SOFTKVM_CGEVENT_POINTER_SPEED:-0.5988}" \
+  SOFTKVM_CGEVENT_POINTER_SPEED="${SOFTKVM_CGEVENT_POINTER_SPEED:-1.0}" \
+  SOFTKVM_MAC_MOTION_MODE="${SOFTKVM_MAC_MOTION_MODE:-direct}" \
   SOFTKVM_LATENCY_LOG="${SOFTKVM_LATENCY_LOG:-0}" \
   SOFTKVM_LATENCY_WARN_MS="${SOFTKVM_LATENCY_WARN_MS:-8}" \
   "$ROOT/target/debug/softkvm" client --listen "0.0.0.0:$PORT" --sink "$SINK"

@@ -76,6 +76,8 @@ fn build_info() -> Result<()> {
         "mac_motion_flush default_ms={} env=SOFTKVM_MAC_MOTION_FLUSH_MS",
         DEFAULT_MAC_MOTION_FLUSH_INTERVAL_MS
     );
+    println!("mac_motion_mode default=cg-event:direct,other:coalesced env=SOFTKVM_MAC_MOTION_MODE");
+    println!("cgevent_pointer_speed default=1.0 env=SOFTKVM_CGEVENT_POINTER_SPEED");
     Ok(())
 }
 
@@ -466,9 +468,80 @@ async fn start_mac_motion_tasks(
     event_tx: mpsc::UnboundedSender<MacMotionEvent>,
 ) -> Result<()> {
     let motion_sink = make_sink(sink).await?;
-    tokio::spawn(mac_udp_motion_accumulator_task(socket, shared.clone()));
-    tokio::spawn(mac_motion_writer_task(motion_sink, sink, shared, event_tx));
+    match mac_motion_mode(sink) {
+        MacMotionMode::Direct => {
+            let (packet_tx, packet_rx) = mpsc::unbounded_channel();
+            info!("using direct mac UDP motion mode");
+            tokio::spawn(mac_udp_motion_direct_reader_task(socket, packet_tx));
+            tokio::spawn(mac_direct_motion_writer_task(
+                motion_sink,
+                sink,
+                shared,
+                packet_rx,
+                event_tx,
+            ));
+        }
+        MacMotionMode::Coalesced => {
+            info!("using coalesced mac UDP motion mode");
+            tokio::spawn(mac_udp_motion_accumulator_task(socket, shared.clone()));
+            tokio::spawn(mac_motion_writer_task(motion_sink, sink, shared, event_tx));
+        }
+    }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MacMotionMode {
+    Direct,
+    Coalesced,
+}
+
+fn mac_motion_mode(sink: SinkKind) -> MacMotionMode {
+    if let Ok(value) = std::env::var("SOFTKVM_MAC_MOTION_MODE") {
+        return match value.to_ascii_lowercase().as_str() {
+            "direct" | "immediate" => MacMotionMode::Direct,
+            "coalesced" | "batch" | "timer" => MacMotionMode::Coalesced,
+            other => {
+                warn!(value = other, "unknown SOFTKVM_MAC_MOTION_MODE; using default");
+                default_mac_motion_mode(sink)
+            }
+        };
+    }
+    default_mac_motion_mode(sink)
+}
+
+fn default_mac_motion_mode(sink: SinkKind) -> MacMotionMode {
+    if matches!(sink, SinkKind::CgEvent) {
+        MacMotionMode::Direct
+    } else {
+        MacMotionMode::Coalesced
+    }
+}
+
+async fn mac_udp_motion_direct_reader_task(
+    socket: UdpSocket,
+    packet_tx: mpsc::UnboundedSender<MotionDatagram>,
+) {
+    let mut buffer = [0_u8; MOTION_DATAGRAM_LEN];
+    loop {
+        match socket.recv_from(&mut buffer).await {
+            Ok((len, addr)) => {
+                let Some(packet) = MotionDatagram::decode(&buffer[..len]) else {
+                    if latency::enabled() {
+                        warn!(%addr, len, "ignored malformed udp motion packet");
+                    }
+                    continue;
+                };
+                if packet_tx.send(packet).is_err() {
+                    break;
+                }
+            }
+            Err(err) => {
+                warn!(?err, "udp motion reader failed");
+                break;
+            }
+        }
+    }
 }
 
 async fn mac_udp_motion_accumulator_task(socket: UdpSocket, shared: Arc<MacMotionShared>) {
@@ -487,6 +560,70 @@ async fn mac_udp_motion_accumulator_task(socket: UdpSocket, shared: Arc<MacMotio
             Err(err) => {
                 warn!(?err, "udp motion reader failed");
                 break;
+            }
+        }
+    }
+}
+
+async fn mac_direct_motion_writer_task(
+    mut motion_sink: Box<dyn HidSink>,
+    sink: SinkKind,
+    shared: Arc<MacMotionShared>,
+    mut packet_rx: mpsc::UnboundedReceiver<MotionDatagram>,
+    event_tx: mpsc::UnboundedSender<MacMotionEvent>,
+) {
+    let mut right_edge_release_armed = false;
+    let mut was_active = false;
+
+    while let Some(packet) = packet_rx.recv().await {
+        let active = shared.remote_active.load(Ordering::Acquire);
+        if active != was_active {
+            right_edge_release_armed = false;
+            was_active = active;
+        }
+        if !active || (packet.dx == 0 && packet.dy == 0) {
+            continue;
+        }
+
+        let dx = packet.dx.clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH);
+        let dy = packet.dy.clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH);
+
+        if right_edge_release_armed && dx > 0 && mac_cursor_at_right_edge() {
+            if shared.request_release_once() {
+                let (_, y_ratio) = mac_cursor_ratios().unwrap_or((0.0, 0.5));
+                let _ = event_tx.send(MacMotionEvent::ReleaseHost {
+                    entry_y_ratio: Some(y_ratio),
+                });
+            }
+            continue;
+        }
+
+        let started = Instant::now();
+        apply_input(&mut motion_sink, sink, InputEvent::MouseMotion { dx, dy }).await;
+        let elapsed = started.elapsed();
+        if latency::report(elapsed) {
+            info!(
+                target: "softkvm::latency",
+                source_seq = packet.seq,
+                dx,
+                dy,
+                elapsed_ms = latency::ms(elapsed),
+                "mac direct immediate motion apply latency"
+            );
+        }
+
+        if dx < 0
+            && mac_cursor_right_gap().is_some_and(|gap| gap >= MAC_RIGHT_EDGE_RELEASE_REARM_PX)
+        {
+            right_edge_release_armed = true;
+        }
+
+        if right_edge_release_armed && dx > 0 && mac_cursor_at_right_edge() {
+            if shared.request_release_once() {
+                let (_, y_ratio) = mac_cursor_ratios().unwrap_or((0.0, 0.5));
+                let _ = event_tx.send(MacMotionEvent::ReleaseHost {
+                    entry_y_ratio: Some(y_ratio),
+                });
             }
         }
     }

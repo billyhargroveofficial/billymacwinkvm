@@ -268,13 +268,31 @@ impl CgEventSink {
     }
 
     fn post_mouse_event(&self, event_type: u32, point: CGPoint, button: u32) -> Result<()> {
+        let started = Instant::now();
         let event = unsafe { CGEventCreateMouseEvent(std::ptr::null(), event_type, point, button) };
         if event.is_null() {
             bail!("CGEventCreateMouseEvent returned null");
         }
+        let create_elapsed = started.elapsed();
+        let post_started = Instant::now();
         unsafe {
             CGEventPost(CG_HID_EVENT_TAP, event);
             CFRelease(event.cast_const());
+        }
+        let post_elapsed = post_started.elapsed();
+        let total_elapsed = started.elapsed();
+        if latency::report(total_elapsed) {
+            info!(
+                target: "softkvm::latency",
+                event_type,
+                button,
+                x = point.x,
+                y = point.y,
+                create_ms = latency::ms(create_elapsed),
+                post_ms = latency::ms(post_elapsed),
+                total_ms = latency::ms(total_elapsed),
+                "cgevent mouse post latency"
+            );
         }
         Ok(())
     }
@@ -871,7 +889,7 @@ fn cgevent_pointer_speed() -> f64 {
             .ok()
             .and_then(|value| value.parse::<f64>().ok())
             .filter(|value| value.is_finite())
-            .unwrap_or(0.5988)
+            .unwrap_or(1.0)
             .clamp(0.05, 4.0)
     })
 }
