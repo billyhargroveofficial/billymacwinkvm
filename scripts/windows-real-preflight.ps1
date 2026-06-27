@@ -35,6 +35,11 @@ Write-Host "== Binary =="
 if ($env:SOFTKVM_LATENCY_LOG) {
   Write-Host "Latency log: enabled"
 }
+if ($env:SOFTKVM_MOTION_TRANSPORT -eq "tcp") {
+  Write-Host "Motion transport: forced tcp/json fallback"
+} else {
+  Write-Host "Motion transport: udp/binary on the same peer port"
+}
 
 Write-Host ""
 Write-Host "== TCP to Mac =="

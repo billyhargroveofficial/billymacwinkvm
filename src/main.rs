@@ -10,25 +10,24 @@ use clap::Parser;
 use cli::{Cli, Command, SinkKind};
 use hid::{HidSink, KarabinerProbe, LogSink};
 use protocol::{
-    ClientControlEvent, Frame, InputEvent, KeyCode, KeyState, Message, Modifier, MouseButton,
-    ProtocolHello,
+    ClientControlEvent, Frame, InputEvent, KeyCode, KeyState, MOTION_DATAGRAM_LEN, Message,
+    Modifier, MotionDatagram, MouseButton, ProtocolHello,
 };
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::time::Instant;
 use tokio::net::{
-    TcpStream,
+    TcpStream, UdpSocket,
     tcp::{OwnedReadHalf, OwnedWriteHalf},
 };
 use tokio::sync::mpsc;
-use tokio::time::{Duration, MissedTickBehavior, interval, sleep};
+use tokio::time::{Duration, sleep};
 use tracing::{info, trace, warn};
 use uuid::Uuid;
 
-const MAC_MOTION_FLUSH_INTERVAL_MS: u64 = 4;
 const MAC_RIGHT_EDGE_RELEASE_REARM_PX: f64 = 48.0;
 #[cfg(target_os = "macos")]
 const MAC_EDGE_ENTRY_GAP_PX: f64 = 2.0;
-const MAX_CLIENT_MOTION_DRAIN_PER_TURN: usize = 64;
 const MAX_MOTION_DELTA_PER_FLUSH: i32 = 512;
 
 #[tokio::main]
@@ -112,7 +111,13 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .with_context(|| format!("bind {listen}"))?;
+    let udp_socket = UdpSocket::bind(&listen)
+        .await
+        .with_context(|| format!("bind udp motion {listen}"))?;
+    let (motion_tx, mut motion_rx) = mpsc::unbounded_channel();
+    tokio::spawn(udp_motion_reader_task(udp_socket, motion_tx));
     info!(%listen, "softkvm client listening");
+    info!(%listen, "softkvm udp motion listening");
 
     loop {
         let (stream, addr) = listener.accept().await?;
@@ -120,6 +125,7 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
         if let Err(err) = stream.set_nodelay(true) {
             warn!(?err, "failed to set TCP_NODELAY on accepted host stream");
         }
+        while motion_rx.try_recv().is_ok() {}
 
         let (read_half, write_half) = stream.into_split();
         let mut writer = transport::FrameWriter::new(write_half);
@@ -130,44 +136,75 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
         let mut client_seq = 1_u64;
         let mut saw_frame = false;
         let mut touched_input = false;
-        let mut pending_motion = PendingMotion::default();
-        let mut flush_timer = interval(Duration::from_millis(MAC_MOTION_FLUSH_INTERVAL_MS));
-        flush_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut read_error = None;
-        let mut deferred_read_event = None;
 
         loop {
-            let event = if let Some(event) = deferred_read_event.take() {
-                Some(event)
-            } else {
+            let event = {
                 tokio::select! {
-                    biased;
-
-                    _ = flush_timer.tick(), if pending_motion.has_motion() => {
-                        let _ = flush_client_motion(
-                            &mut hid_sink,
-                            sink,
-                            &mut writer,
-                            client_session_id,
-                            &mut client_seq,
-                            &mut client_state,
-                            &mut pending_motion,
-                        ).await;
-                        flush_timer.reset();
-                        continue;
+                    event = frame_rx.recv() => {
+                        let Some(event) = event else {
+                            break;
+                        };
+                        ClientEvent::Tcp(event)
                     }
-                    event = frame_rx.recv() => event,
+                    motion = motion_rx.recv() => {
+                        let Some(motion) = motion else {
+                            continue;
+                        };
+                        ClientEvent::Motion(motion)
+                    }
                 }
             };
 
-            let Some(event) = event else {
-                break;
-            };
-
             let (frame, read_at) = match event {
-                ClientReadEvent::Frame { frame, read_at } => (frame, read_at),
-                ClientReadEvent::Disconnected => break,
-                ClientReadEvent::Failed(err) => {
+                ClientEvent::Motion(motion) => {
+                    if motion.addr.ip() != addr.ip() {
+                        trace!(
+                            motion_addr = %motion.addr,
+                            tcp_addr = %addr,
+                            "ignoring udp motion from non-active host"
+                        );
+                        continue;
+                    }
+
+                    let queue_elapsed = motion.read_at.elapsed();
+                    if latency::report(queue_elapsed) {
+                        let level = if latency::slow(queue_elapsed) {
+                            "slow"
+                        } else {
+                            "trace"
+                        };
+                        info!(
+                            target: "softkvm::latency",
+                            level,
+                            seq = motion.packet.seq,
+                            queue_ms = latency::ms(queue_elapsed),
+                            "mac udp motion queue latency"
+                        );
+                    }
+
+                    if !client_state.remote_active {
+                        continue;
+                    }
+                    touched_input = true;
+                    handle_client_motion(
+                        &mut hid_sink,
+                        sink,
+                        &mut writer,
+                        client_session_id,
+                        &mut client_seq,
+                        &mut client_state,
+                        motion.packet.dx,
+                        motion.packet.dy,
+                        "udp",
+                        motion.packet.seq,
+                    )
+                    .await;
+                    continue;
+                }
+                ClientEvent::Tcp(ClientReadEvent::Frame { frame, read_at }) => (frame, read_at),
+                ClientEvent::Tcp(ClientReadEvent::Disconnected) => break,
+                ClientEvent::Tcp(ClientReadEvent::Failed(err)) => {
                     read_error = Some(err);
                     break;
                 }
@@ -190,12 +227,12 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
             }
 
             saw_frame = true;
+            let frame_seq = frame.seq;
             match frame.message {
                 Message::Hello(hello) => {
                     info!(?hello, "host hello");
                 }
                 Message::HostState(state) => {
-                    pending_motion.clear();
                     info!(?state, "host state");
                     client_state.set_remote_active(state.remote_active);
                     if state.remote_active {
@@ -215,60 +252,19 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
                     }
 
                     if let InputEvent::MouseMotion { dx, dy } = event {
-                        pending_motion.add(dx, dy);
-                        drain_queued_motion(
-                            &mut frame_rx,
-                            &mut pending_motion,
-                            &mut deferred_read_event,
+                        handle_client_motion(
+                            &mut hid_sink,
+                            sink,
+                            &mut writer,
+                            client_session_id,
+                            &mut client_seq,
+                            &mut client_state,
+                            dx,
+                            dy,
+                            "tcp",
+                            frame_seq,
                         )
-                        .inspect(|drained| {
-                            if latency::enabled() || *drained >= MAX_CLIENT_MOTION_DRAIN_PER_TURN {
-                                info!(
-                                    target: "softkvm::latency",
-                                    drained,
-                                    pending_dx = pending_motion.dx,
-                                    pending_dy = pending_motion.dy,
-                                    frame_queue_len = frame_rx.len(),
-                                    "mac drained queued motion"
-                                );
-                            }
-                        });
-                        if client_state.take_just_activated() {
-                            let started = Instant::now();
-                            let _ = flush_client_motion(
-                                &mut hid_sink,
-                                sink,
-                                &mut writer,
-                                client_session_id,
-                                &mut client_seq,
-                                &mut client_state,
-                                &mut pending_motion,
-                            )
-                            .await;
-                            let elapsed = started.elapsed();
-                            if latency::report(elapsed) {
-                                info!(
-                                    target: "softkvm::latency",
-                                    elapsed_ms = latency::ms(elapsed),
-                                    "mac first motion flush after activation"
-                                );
-                            }
-                            flush_timer.reset();
-                        }
-                        continue;
-                    }
-
-                    if flush_client_motion(
-                        &mut hid_sink,
-                        sink,
-                        &mut writer,
-                        client_session_id,
-                        &mut client_seq,
-                        &mut client_state,
-                        &mut pending_motion,
-                    )
-                    .await
-                    {
+                        .await;
                         continue;
                     }
 
@@ -292,7 +288,6 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
                 }
                 Message::InputReset => {
                     touched_input = true;
-                    pending_motion.clear();
                     client_state.reset_keys();
                     reset_input(&mut hid_sink, sink).await;
                 }
@@ -301,17 +296,6 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
                 }
             }
         }
-
-        flush_client_motion(
-            &mut hid_sink,
-            sink,
-            &mut writer,
-            client_session_id,
-            &mut client_seq,
-            &mut client_state,
-            &mut pending_motion,
-        )
-        .await;
 
         if saw_frame {
             warn!(%addr, "host disconnected");
@@ -328,10 +312,21 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
     }
 }
 
+enum ClientEvent {
+    Tcp(ClientReadEvent),
+    Motion(UdpMotionEvent),
+}
+
 enum ClientReadEvent {
     Frame { frame: Frame, read_at: Instant },
     Disconnected,
     Failed(anyhow::Error),
+}
+
+struct UdpMotionEvent {
+    packet: MotionDatagram,
+    addr: SocketAddr,
+    read_at: Instant,
 }
 
 async fn client_reader_task(read_half: OwnedReadHalf, tx: mpsc::UnboundedSender<ClientReadEvent>) {
@@ -361,86 +356,54 @@ async fn client_reader_task(read_half: OwnedReadHalf, tx: mpsc::UnboundedSender<
     }
 }
 
-fn drain_queued_motion(
-    frame_rx: &mut mpsc::UnboundedReceiver<ClientReadEvent>,
-    pending_motion: &mut PendingMotion,
-    deferred_read_event: &mut Option<ClientReadEvent>,
-) -> Option<usize> {
-    let mut drained = 0_usize;
-    for _ in 0..MAX_CLIENT_MOTION_DRAIN_PER_TURN {
-        let Ok(event) = frame_rx.try_recv() else {
-            break;
-        };
-        match event {
-            ClientReadEvent::Frame {
-                frame:
-                    Frame {
-                        message: Message::Input(InputEvent::MouseMotion { dx, dy }),
-                        ..
-                    },
-                ..
-            } => {
-                pending_motion.add(dx, dy);
-                drained += 1;
+async fn udp_motion_reader_task(socket: UdpSocket, tx: mpsc::UnboundedSender<UdpMotionEvent>) {
+    let mut buffer = [0_u8; MOTION_DATAGRAM_LEN];
+    loop {
+        match socket.recv_from(&mut buffer).await {
+            Ok((len, addr)) => {
+                let read_at = Instant::now();
+                let Some(packet) = MotionDatagram::decode(&buffer[..len]) else {
+                    if latency::enabled() {
+                        warn!(%addr, len, "ignored malformed udp motion packet");
+                    }
+                    continue;
+                };
+                if tx
+                    .send(UdpMotionEvent {
+                        packet,
+                        addr,
+                        read_at,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
-            other => {
-                *deferred_read_event = Some(other);
+            Err(err) => {
+                warn!(?err, "udp motion reader failed");
                 break;
             }
         }
     }
-    (drained > 0).then_some(drained)
 }
 
-#[derive(Default)]
-struct PendingMotion {
-    dx: i32,
-    dy: i32,
-}
-
-impl PendingMotion {
-    fn add(&mut self, dx: i32, dy: i32) {
-        self.dx = self.dx.saturating_add(dx);
-        self.dy = self.dy.saturating_add(dy);
-    }
-
-    fn clear(&mut self) {
-        self.dx = 0;
-        self.dy = 0;
-    }
-
-    fn has_motion(&self) -> bool {
-        self.dx != 0 || self.dy != 0
-    }
-
-    fn take(&mut self) -> Option<(i32, i32)> {
-        if !self.has_motion() {
-            return None;
-        }
-        Some((
-            std::mem::take(&mut self.dx)
-                .clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH),
-            std::mem::take(&mut self.dy)
-                .clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH),
-        ))
-    }
-}
-
-async fn flush_client_motion(
+async fn handle_client_motion(
     hid_sink: &mut Box<dyn HidSink>,
     sink: SinkKind,
     writer: &mut transport::FrameWriter<OwnedWriteHalf>,
     client_session_id: Uuid,
     client_seq: &mut u64,
     client_state: &mut ClientRuntimeState,
-    pending_motion: &mut PendingMotion,
+    dx: i32,
+    dy: i32,
+    source: &'static str,
+    source_seq: u64,
 ) -> bool {
-    let Some((dx, dy)) = pending_motion.take() else {
-        return false;
-    };
     if !client_state.remote_active {
         return false;
     }
+    let dx = dx.clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH);
+    let dy = dy.clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH);
 
     if client_state.should_release_before_motion(dx) && mac_cursor_at_right_edge() {
         let (_, y_ratio) = mac_cursor_ratios().unwrap_or((0.0, 0.5));
@@ -459,7 +422,20 @@ async fn flush_client_motion(
         return true;
     }
 
+    let first_after_activation = client_state.take_just_activated();
+    let started = Instant::now();
     apply_input(hid_sink, sink, InputEvent::MouseMotion { dx, dy }).await;
+    let elapsed = started.elapsed();
+    if first_after_activation || latency::report(elapsed) {
+        info!(
+            target: "softkvm::latency",
+            source,
+            source_seq,
+            elapsed_ms = latency::ms(elapsed),
+            first_after_activation,
+            "mac motion apply latency"
+        );
+    }
     client_state.update_right_edge_release_arm(dx);
 
     if client_state.should_release_after_motion(dx) && mac_cursor_at_right_edge() {

@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u16 = 0;
+pub const MOTION_DATAGRAM_LEN: usize = 24;
+const MOTION_DATAGRAM_MAGIC: &[u8; 4] = b"SKM1";
+const MOTION_DATAGRAM_TYPE_MOUSE_MOTION: u8 = 1;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Frame {
@@ -139,6 +142,71 @@ pub enum KeyCode {
     Tab,
     Usb(u16),
     Other(u32),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MotionDatagram {
+    pub seq: u64,
+    pub dx: i32,
+    pub dy: i32,
+}
+
+impl MotionDatagram {
+    #[cfg_attr(not(any(test, windows)), allow(dead_code))]
+    pub fn encode(self) -> [u8; MOTION_DATAGRAM_LEN] {
+        let mut out = [0_u8; MOTION_DATAGRAM_LEN];
+        out[0..4].copy_from_slice(MOTION_DATAGRAM_MAGIC);
+        out[4] = MOTION_DATAGRAM_TYPE_MOUSE_MOTION;
+        out[8..16].copy_from_slice(&self.seq.to_le_bytes());
+        out[16..20].copy_from_slice(&self.dx.to_le_bytes());
+        out[20..24].copy_from_slice(&self.dy.to_le_bytes());
+        out
+    }
+
+    pub fn decode(input: &[u8]) -> Option<Self> {
+        if input.len() != MOTION_DATAGRAM_LEN {
+            return None;
+        }
+        if &input[0..4] != MOTION_DATAGRAM_MAGIC {
+            return None;
+        }
+        if input[4] != MOTION_DATAGRAM_TYPE_MOUSE_MOTION {
+            return None;
+        }
+
+        let seq = u64::from_le_bytes(input[8..16].try_into().ok()?);
+        let dx = i32::from_le_bytes(input[16..20].try_into().ok()?);
+        let dy = i32::from_le_bytes(input[20..24].try_into().ok()?);
+        Some(Self { seq, dx, dy })
+    }
+}
+
+#[cfg(test)]
+mod motion_tests {
+    use super::*;
+
+    #[test]
+    fn motion_datagram_round_trips() {
+        let packet = MotionDatagram {
+            seq: 42,
+            dx: -17,
+            dy: 23,
+        };
+        assert_eq!(MotionDatagram::decode(&packet.encode()), Some(packet));
+    }
+
+    #[test]
+    fn motion_datagram_rejects_bad_input() {
+        assert_eq!(MotionDatagram::decode(&[]), None);
+        let mut packet = MotionDatagram {
+            seq: 1,
+            dx: 2,
+            dy: 3,
+        }
+        .encode();
+        packet[0] = b'X';
+        assert_eq!(MotionDatagram::decode(&packet), None);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

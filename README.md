@@ -19,12 +19,11 @@ The repo currently contains:
 - Protocol-only `client` and `probe` commands.
 - Karabiner VirtualHID wire-format encoder.
 - Windows Raw Input host MVP with `Ctrl+Alt+\` toggle and `mac-left` edge activation.
+- Split transport: TCP for reliable state/keyboard/buttons/wheel, binary UDP `SKM1` datagrams for mouse motion.
 - Setup docs under `docs/`.
 
 Still missing for the final "feels native on a 200 Hz monitor" version:
 
-- Windows low-level hook suppression while macOS is active.
-- QUIC/datagram transport and pointer coalescing.
 - Real startup installers for macOS launchd and Windows Task Scheduler.
 
 ## Mac Check

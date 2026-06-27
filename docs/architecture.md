@@ -22,7 +22,7 @@ Hard requirements:
 ```text
 Windows physical devices
   -> softkvm host, Win32 Raw Input
-  -> QUIC transport
+  -> split local transport
   -> softkvm macOS client
   -> Karabiner VirtualHID / DriverKit virtual HID
   -> macOS input stack
@@ -31,22 +31,29 @@ Windows physical devices
 
 ## Latency Model
 
-The final transport should use QUIC, not a single TCP stream:
+The current low-latency transport is split into two planes:
 
-- Reliable stream: focus enter/leave, key events, mouse button events, scroll, all-up reset.
-- QUIC datagrams: mouse motion, coalesced to display tick rate.
+- Reliable TCP frame stream: focus enter/leave, key events, mouse button events, scroll, all-up reset.
+- Binary UDP datagrams on the same host/port: mouse motion (`SKM1`, `seq`, `dx`, `dy`).
 
 Old mouse movement is disposable. Key/button/focus state is not disposable.
+The first activation motion still rides the reliable stream after `HostState` so
+the macOS client cannot receive movement before it knows the remote side is
+active. Normal movement then uses UDP to avoid TCP head-of-line stalls and JSON
+frame batching. Set `SOFTKVM_MOTION_TRANSPORT=tcp` on Windows to force the old
+TCP path for firewall/debug fallback.
+
 Before sending any ordering-sensitive event such as key down/up, mouse button,
-wheel, focus enter, or focus leave, flush the pending coalesced pointer motion or
-attach the latest pointer sequence. Otherwise a click can land at a stale cursor
-position after motion datagrams are dropped.
+wheel, focus enter, or focus leave, keep the reliable event on TCP. If UDP
+movement is dropped, a later motion packet supersedes it; stateful events do not
+use UDP.
 
 For 200 Hz displays:
 
 - Drain raw Windows mouse deltas at device rate.
 - Accumulate motion in a nonblocking hot path.
-- Flush at 200 Hz or lower if network pressure rises.
+- Send small UDP motion datagrams immediately; the macOS side applies each
+  motion on receipt instead of draining queued motion into bursts.
 - Include an absolute logical cursor position or pointer sequence in reliable button events so clicks do not land at stale positions after dropped motion datagrams.
 
 ## MVP Order
@@ -55,7 +62,7 @@ For 200 Hz displays:
 2. Build macOS client against the virtual HID path.
 3. Add dev transport and synthetic `probe` sender.
 4. Build Windows Raw Input host.
-5. Replace dev TCP/JSON with QUIC protocol v0.
+5. Replace dev TCP/JSON mouse motion with a binary UDP motion plane.
 6. Add startup installers and rollback commands.
 
 Do not spend serious time on Windows capture until the macOS virtual HID proof is green.

@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::net::TcpStream;
+use tokio::net::UdpSocket;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, MissedTickBehavior, interval};
@@ -45,7 +46,7 @@ use windows::core::w;
 use crate::latency;
 use crate::protocol::{
     ClientControlEvent, Frame, HostStateEvent, InputEvent, KeyCode, KeyState, Message, Modifier,
-    MouseButton, ProtocolHello,
+    MotionDatagram, MouseButton, ProtocolHello,
 };
 use crate::transport::FrameWriter;
 
@@ -75,13 +76,14 @@ pub async fn run_host(peer: String, layout: String) -> Result<()> {
         .await
         .with_context(|| format!("connect {peer}"))?;
     stream.set_nodelay(true).context("set TCP_NODELAY")?;
+    let motion_transport = MotionTransport::connect(&peer).await;
     let (tx, rx) = mpsc::unbounded_channel();
     HOST_STATE
         .set(Mutex::new(HostState::new(tx, layout.clone())))
         .map_err(|_| anyhow!("Windows host state was already initialized"))?;
 
     let (read_half, write_half) = stream.into_split();
-    tokio::spawn(writer_task(write_half, rx));
+    tokio::spawn(writer_task(write_half, rx, motion_transport));
     tokio::spawn(control_reader_task(read_half));
 
     info!(%peer, %layout, "starting Windows host capture");
@@ -91,7 +93,91 @@ pub async fn run_host(peer: String, layout: String) -> Result<()> {
         .context("run Windows host message loop")
 }
 
-async fn writer_task(stream: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<HostCommand>) {
+enum MotionTransport {
+    Udp(UdpMotionWriter),
+    Tcp,
+}
+
+impl MotionTransport {
+    async fn connect(peer: &str) -> Self {
+        if std::env::var("SOFTKVM_MOTION_TRANSPORT")
+            .is_ok_and(|value| value.eq_ignore_ascii_case("tcp"))
+        {
+            info!("using tcp/json motion transport because SOFTKVM_MOTION_TRANSPORT=tcp");
+            return Self::Tcp;
+        }
+
+        match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(socket) => match socket.connect(peer).await {
+                Ok(()) => {
+                    info!(%peer, "using udp/binary motion transport");
+                    Self::Udp(UdpMotionWriter { socket, seq: 1 })
+                }
+                Err(err) => {
+                    warn!(?err, %peer, "udp motion connect failed; falling back to tcp/json motion");
+                    Self::Tcp
+                }
+            },
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "udp motion bind failed; falling back to tcp/json motion"
+                );
+                Self::Tcp
+            }
+        }
+    }
+
+    async fn send_motion(&mut self, dx: i32, dy: i32) -> Result<bool> {
+        match self {
+            Self::Udp(writer) => {
+                writer.send_motion(dx, dy).await?;
+                Ok(true)
+            }
+            Self::Tcp => Ok(false),
+        }
+    }
+}
+
+struct UdpMotionWriter {
+    socket: UdpSocket,
+    seq: u64,
+}
+
+impl UdpMotionWriter {
+    async fn send_motion(&mut self, dx: i32, dy: i32) -> Result<()> {
+        let packet = MotionDatagram {
+            seq: self.seq,
+            dx: dx.clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH),
+            dy: dy.clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH),
+        };
+        let encoded = packet.encode();
+        let started = Instant::now();
+        self.socket
+            .send(&encoded)
+            .await
+            .context("send udp motion packet")?;
+        let elapsed = started.elapsed();
+        if latency::report(elapsed) {
+            info!(
+                target: "softkvm::latency",
+                seq = packet.seq,
+                dx = packet.dx,
+                dy = packet.dy,
+                elapsed_ms = latency::ms(elapsed),
+                "windows udp motion send latency"
+            );
+        }
+        self.seq = self.seq.wrapping_add(1);
+        Ok(())
+    }
+}
+
+async fn writer_task(
+    stream: OwnedWriteHalf,
+    mut rx: mpsc::UnboundedReceiver<HostCommand>,
+    mut motion_transport: MotionTransport,
+) {
     let mut writer = FrameWriter::new(stream);
     let session_id = Uuid::new_v4();
     let mut seq = 1_u64;
@@ -127,6 +213,7 @@ async fn writer_task(stream: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Hos
                 command,
                 &mut rx,
                 &mut writer,
+                &mut motion_transport,
                 session_id,
                 &mut seq,
                 &mut pending_dx,
@@ -160,6 +247,7 @@ async fn writer_task(stream: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Hos
                     command,
                     &mut rx,
                     &mut writer,
+                    &mut motion_transport,
                     session_id,
                     &mut seq,
                     &mut pending_dx,
@@ -177,6 +265,7 @@ async fn handle_host_command(
     command: HostCommand,
     rx: &mut mpsc::UnboundedReceiver<HostCommand>,
     writer: &mut FrameWriter<OwnedWriteHalf>,
+    motion_transport: &mut MotionTransport,
     session_id: Uuid,
     seq: &mut u64,
     pending_dx: &mut i32,
@@ -185,6 +274,18 @@ async fn handle_host_command(
 ) -> bool {
     match command {
         HostCommand::Input(InputEvent::MouseMotion { dx, dy }) => {
+            match motion_transport.send_motion(dx, dy).await {
+                Ok(true) => return true,
+                Ok(false) => {}
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        "udp motion send failed; falling back to tcp/json motion"
+                    );
+                    *motion_transport = MotionTransport::Tcp;
+                }
+            }
+
             *pending_dx = (*pending_dx).saturating_add(dx);
             *pending_dy = (*pending_dy).saturating_add(dy);
 
