@@ -18,8 +18,14 @@ The repo currently contains:
 - Rust CLI scaffold.
 - Protocol-only `client` and `probe` commands.
 - Karabiner VirtualHID wire-format encoder.
-- Windows-host design stub.
+- Windows Raw Input host MVP with `Ctrl+Alt+\` toggle and `mac-left` edge activation.
 - Setup docs under `docs/`.
+
+Still missing for the final "feels native on a 200 Hz monitor" version:
+
+- Windows low-level hook suppression while macOS is active.
+- QUIC/datagram transport and pointer coalescing.
+- Real startup installers for macOS launchd and Windows Task Scheduler.
 
 ## Mac Check
 
@@ -35,6 +41,7 @@ cargo test
 cargo run -- mac-hid-probe
 cargo run -- client --listen 127.0.0.1:49321 --sink log
 cargo run -- probe --peer 127.0.0.1:49321
+./scripts/parallels-probe.sh
 ```
 
 ## Docs

@@ -20,6 +20,12 @@ Send synthetic input:
 cargo run -- probe --peer 127.0.0.1:49321
 ```
 
+Run the Windows ARM smoke test through Parallels:
+
+```bash
+./scripts/parallels-probe.sh
+```
+
 Check Karabiner VirtualHID presence:
 
 ```bash
@@ -36,7 +42,7 @@ pkill -x ShareMouse 2>/dev/null || true
 
 ## Windows
 
-Run the future host as a user process:
+Run the host as a user process:
 
 ```powershell
 softkvm.exe host --peer <mac-ip>:49321 --layout mac-left
@@ -48,4 +54,17 @@ Create a firewall rule:
 New-NetFirewallRule -DisplayName "softkvm" -Direction Outbound -Program "C:\path\to\softkvm.exe" -Action Allow
 ```
 
-Task Scheduler is preferred for login startup during development. A Windows service is not the right place for input capture.
+Task Scheduler is preferred for login startup during development. A Windows service is not the right place for input capture because the host needs the logged-in desktop session.
+
+Current host MVP:
+
+- Captures mouse and keyboard through Raw Input.
+- `Ctrl+Alt+\` toggles remote macOS control.
+- With `--layout mac-left`, pushing left at the Windows virtual-screen edge enables remote control.
+- Clips the Windows cursor to the left edge while remote control is active.
+
+Not implemented yet:
+
+- Low-level hook suppression, so local Windows apps can still see input while the MVP is active.
+- Wake/reconnect policy.
+- QUIC/datagram transport.

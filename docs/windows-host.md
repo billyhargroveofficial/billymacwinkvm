@@ -25,7 +25,20 @@ Flags:
 - `RIDEV_INPUTSINK`
 - `RIDEV_DEVNOTIFY`
 
-## State Machine
+## Current MVP
+
+Implemented in `src/platform/windows.rs`:
+
+- Hidden message-only `HWND`.
+- `RegisterRawInputDevices` for mouse and keyboard.
+- `GetRawInputData` parsing for relative mouse motion, buttons, wheel, keyboard keys, and modifiers.
+- `Ctrl+Alt+\` via `RegisterHotKey`.
+- `mac-left` edge activation when the cursor is at the Windows virtual-screen left edge and the mouse moves further left.
+- Cursor clipping to the left edge while remote macOS control is active.
+
+This is enough to start real Windows-host capture, but it is not the final high-polish capture path yet because local suppression hooks are not wired.
+
+## Target State Machine
 
 ```text
 HostActive:
