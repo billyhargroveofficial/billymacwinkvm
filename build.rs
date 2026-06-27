@@ -2,6 +2,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/refs/heads/main");
     println!("cargo:rerun-if-env-changed=SOFTKVM_BUILD_GIT_HASH");
 
     let git_hash = std::env::var("SOFTKVM_BUILD_GIT_HASH")

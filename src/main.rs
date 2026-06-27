@@ -7,14 +7,14 @@ mod transport;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use cli::{Cli, Command, SinkKind};
+use cli::{BenchTiming, BenchTransport, Cli, Command, SinkKind};
 use hid::{HidSink, KarabinerProbe, LogSink};
 use protocol::{
     ClientControlEvent, Frame, InputEvent, KeyCode, KeyState, MOTION_DATAGRAM_LEN, Message,
     Modifier, MotionDatagram, MouseButton, ProtocolHello,
 };
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
 use std::time::Instant;
 use tokio::net::{
     TcpStream, UdpSocket,
@@ -39,6 +39,9 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    #[cfg(windows)]
+    platform::windows::prepare_low_latency_process();
+
     match cli.command {
         Command::BuildInfo => build_info(),
         Command::GenPsk => gen_psk(),
@@ -48,6 +51,14 @@ async fn main() -> Result<()> {
         Command::MacKeySmoke => mac_key_smoke().await,
         Command::Client { listen, sink } => run_client(listen, sink).await,
         Command::Probe { peer } => run_probe(peer).await,
+        Command::MotionBench {
+            peer,
+            transport,
+            timing,
+            hz,
+            seconds,
+            dx,
+        } => run_motion_bench(peer, transport, timing, hz, seconds, dx).await,
         Command::Host { peer, layout } => run_host(peer, layout).await,
     }
 }
@@ -858,6 +869,169 @@ async fn run_probe(peer: String) -> Result<()> {
         .write_frame(Frame::new(session_id, 302, Message::InputReset))
         .await?;
 
+    Ok(())
+}
+
+async fn run_motion_bench(
+    peer: String,
+    bench_transport: BenchTransport,
+    timing: BenchTiming,
+    hz: u32,
+    seconds: u32,
+    dx: i32,
+) -> Result<()> {
+    bail_if_invalid_bench(hz, seconds)?;
+
+    let stream = TcpStream::connect(&peer)
+        .await
+        .with_context(|| format!("connect {peer}"))?;
+    stream.set_nodelay(true).context("set TCP_NODELAY")?;
+    let udp = if matches!(bench_transport, BenchTransport::Udp) {
+        let socket = StdUdpSocket::bind("0.0.0.0:0").context("bind udp bench")?;
+        socket
+            .connect(&peer)
+            .with_context(|| format!("connect udp bench {peer}"))?;
+        Some(socket)
+    } else {
+        None
+    };
+
+    let mut writer = transport::FrameWriter::new(stream);
+    let session_id = Uuid::new_v4();
+    let mut tcp_seq = 1_u64;
+    writer
+        .write_frame(Frame::new(
+            session_id,
+            tcp_seq,
+            Message::Hello(ProtocolHello {
+                device_name: hostname(),
+                role: "motion-bench".to_owned(),
+                protocol_version: protocol::PROTOCOL_VERSION,
+            }),
+        ))
+        .await?;
+    tcp_seq += 1;
+    writer
+        .write_frame(Frame::new(
+            session_id,
+            tcp_seq,
+            Message::HostState(protocol::HostStateEvent {
+                remote_active: true,
+                reason: "motion bench".to_owned(),
+                entry_x_ratio: Some(0.5),
+                entry_y_ratio: Some(0.5),
+            }),
+        ))
+        .await?;
+    tcp_seq += 1;
+
+    sleep(Duration::from_millis(150)).await;
+
+    let total = u64::from(hz) * u64::from(seconds);
+    let period = Duration::from_secs_f64(1.0 / f64::from(hz));
+    let started = Instant::now();
+    let mut next_tick = tokio::time::Instant::now();
+    let mut max_send_gap = Duration::ZERO;
+    let mut last_send = Instant::now();
+    for i in 0..total {
+        next_tick += period;
+        let direction = if (i / (u64::from(hz) / 2).max(1)) % 2 == 0 {
+            1
+        } else {
+            -1
+        };
+        let event_dx = dx.saturating_mul(direction);
+        match (&udp, bench_transport) {
+            (Some(socket), BenchTransport::Udp) => {
+                let packet = MotionDatagram {
+                    seq: i + 1,
+                    dx: event_dx,
+                    dy: 0,
+                };
+                let encoded = packet.encode();
+                let sent = socket
+                    .send(&encoded)
+                    .context("send udp motion bench packet")?;
+                if sent != encoded.len() {
+                    bail!("short udp motion bench send: {sent}/{}", encoded.len());
+                }
+            }
+            _ => {
+                writer
+                    .write_frame(Frame::new(
+                        session_id,
+                        tcp_seq,
+                        Message::Input(InputEvent::MouseMotion {
+                            dx: event_dx,
+                            dy: 0,
+                        }),
+                    ))
+                    .await?;
+                tcp_seq += 1;
+            }
+        }
+        let now = Instant::now();
+        max_send_gap = max_send_gap.max(now.saturating_duration_since(last_send));
+        last_send = now;
+        wait_for_bench_tick(next_tick, timing).await;
+    }
+
+    writer
+        .write_frame(Frame::new(session_id, tcp_seq, Message::InputReset))
+        .await?;
+    tcp_seq += 1;
+    writer
+        .write_frame(Frame::new(
+            session_id,
+            tcp_seq,
+            Message::HostState(protocol::HostStateEvent {
+                remote_active: false,
+                reason: "motion bench done".to_owned(),
+                entry_x_ratio: None,
+                entry_y_ratio: None,
+            }),
+        ))
+        .await?;
+
+    println!(
+        "motion_bench transport={bench_transport:?} timing={timing:?} hz={hz} seconds={seconds} packets={total} elapsed_ms={:.3} max_send_gap_ms={:.3}",
+        latency::ms(started.elapsed()),
+        latency::ms(max_send_gap),
+    );
+    Ok(())
+}
+
+async fn wait_for_bench_tick(deadline: tokio::time::Instant, timing: BenchTiming) {
+    match timing {
+        BenchTiming::Sleep => tokio::time::sleep_until(deadline).await,
+        BenchTiming::Spin => {
+            const SPIN_MARGIN: Duration = Duration::from_millis(2);
+            loop {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let remaining = deadline - now;
+                if remaining > SPIN_MARGIN {
+                    tokio::time::sleep(remaining - SPIN_MARGIN).await;
+                } else {
+                    while tokio::time::Instant::now() < deadline {
+                        std::hint::spin_loop();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn bail_if_invalid_bench(hz: u32, seconds: u32) -> Result<()> {
+    if hz == 0 || hz > 2000 {
+        bail!("--hz must be in 1..=2000");
+    }
+    if seconds == 0 || seconds > 120 {
+        bail!("--seconds must be in 1..=120");
+    }
     Ok(())
 }
 

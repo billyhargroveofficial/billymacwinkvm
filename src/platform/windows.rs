@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::net::UdpSocket as StdUdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::net::TcpStream;
-use tokio::net::UdpSocket;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, MissedTickBehavior, interval};
@@ -17,7 +17,12 @@ use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, 
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
 };
+use windows::Win32::Media::timeBeginPeriod;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentThread, HIGH_PRIORITY_CLASS, SetPriorityClass, SetThreadPriority,
+    THREAD_PRIORITY_HIGHEST,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey,
     VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_INSERT,
@@ -67,6 +72,31 @@ const SCANCODE_NON_US_BACKSLASH: u32 = 0x56;
 static HOST_STATE: OnceLock<Mutex<HostState>> = OnceLock::new();
 static REMOTE_ACTIVE_FAST: AtomicBool = AtomicBool::new(false);
 
+pub fn prepare_low_latency_process() {
+    let timer_result = unsafe { timeBeginPeriod(1) };
+    if timer_result == 0 {
+        info!("enabled Windows 1ms timer period");
+    } else {
+        warn!(result = timer_result, "timeBeginPeriod(1) failed");
+    }
+
+    if let Err(err) = unsafe { SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS) } {
+        warn!(?err, "failed to raise Windows process priority");
+    } else {
+        info!("raised Windows process priority");
+    }
+
+    prepare_low_latency_thread("main thread");
+}
+
+fn prepare_low_latency_thread(label: &'static str) {
+    if let Err(err) = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) } {
+        warn!(?err, label, "failed to raise Windows thread priority");
+    } else {
+        info!(label, "raised Windows thread priority");
+    }
+}
+
 pub async fn run_host(peer: String, layout: String) -> Result<()> {
     if layout != "mac-left" {
         bail!("only --layout mac-left is implemented right now");
@@ -77,9 +107,14 @@ pub async fn run_host(peer: String, layout: String) -> Result<()> {
         .with_context(|| format!("connect {peer}"))?;
     stream.set_nodelay(true).context("set TCP_NODELAY")?;
     let motion_transport = MotionTransport::connect(&peer).await;
+    let direct_motion = motion_transport.direct_writer();
     let (tx, rx) = mpsc::unbounded_channel();
     HOST_STATE
-        .set(Mutex::new(HostState::new(tx, layout.clone())))
+        .set(Mutex::new(HostState::new(
+            tx,
+            layout.clone(),
+            direct_motion,
+        )))
         .map_err(|_| anyhow!("Windows host state was already initialized"))?;
 
     let (read_half, write_half) = stream.into_split();
@@ -94,10 +129,7 @@ pub async fn run_host(peer: String, layout: String) -> Result<()> {
 }
 
 enum MotionTransport {
-    Udp {
-        writer: UdpMotionWriter,
-        confirmed: bool,
-    },
+    Udp { writer: SharedUdpMotionWriter },
     Tcp,
 }
 
@@ -110,13 +142,12 @@ impl MotionTransport {
             return Self::Tcp;
         }
 
-        match UdpSocket::bind("0.0.0.0:0").await {
-            Ok(socket) => match socket.connect(peer).await {
+        match StdUdpSocket::bind("0.0.0.0:0") {
+            Ok(socket) => match socket.connect(peer) {
                 Ok(()) => {
                     info!(%peer, "using udp/binary motion transport");
                     Self::Udp {
-                        writer: UdpMotionWriter { socket, seq: 1 },
-                        confirmed: false,
+                        writer: SharedUdpMotionWriter::new(socket),
                     }
                 }
                 Err(err) => {
@@ -136,18 +167,12 @@ impl MotionTransport {
 
     async fn send_motion(&mut self, dx: i32, dy: i32) -> Result<bool> {
         match self {
-            Self::Udp {
-                writer,
-                confirmed: true,
-            } => {
-                writer.send_motion(dx, dy).await?;
+            Self::Udp { writer } if writer.confirmed() => {
+                writer.send_motion(dx, dy, "writer")?;
                 Ok(true)
             }
-            Self::Udp {
-                writer,
-                confirmed: false,
-            } => {
-                writer.send_motion(0, 0).await?;
+            Self::Udp { writer } => {
+                writer.send_motion(0, 0, "probe")?;
                 Ok(false)
             }
             Self::Tcp => Ok(false),
@@ -155,11 +180,9 @@ impl MotionTransport {
     }
 
     async fn probe(&mut self) {
-        if let Self::Udp {
-            writer,
-            confirmed: false,
-        } = self
-            && let Err(err) = writer.send_motion(0, 0).await
+        if let Self::Udp { writer } = self
+            && !writer.confirmed()
+            && let Err(err) = writer.send_motion(0, 0, "probe")
         {
             warn!(
                 ?err,
@@ -170,37 +193,93 @@ impl MotionTransport {
     }
 
     fn confirm(&mut self) {
-        if let Self::Udp { confirmed, .. } = self
-            && !*confirmed
+        if let Self::Udp { writer } = self
+            && writer.confirm()
         {
-            *confirmed = true;
             info!("udp motion transport confirmed by macOS client");
+        }
+    }
+
+    fn direct_writer(&self) -> Option<SharedUdpMotionWriter> {
+        match self {
+            Self::Udp { writer } => Some(writer.clone()),
+            Self::Tcp => None,
         }
     }
 }
 
-struct UdpMotionWriter {
-    socket: UdpSocket,
-    seq: u64,
+#[derive(Clone)]
+struct SharedUdpMotionWriter {
+    inner: Arc<Mutex<UdpMotionWriterState>>,
 }
 
-impl UdpMotionWriter {
-    async fn send_motion(&mut self, dx: i32, dy: i32) -> Result<()> {
+struct UdpMotionWriterState {
+    socket: StdUdpSocket,
+    seq: u64,
+    confirmed: bool,
+}
+
+impl SharedUdpMotionWriter {
+    fn new(socket: StdUdpSocket) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(UdpMotionWriterState {
+                socket,
+                seq: 1,
+                confirmed: false,
+            })),
+        }
+    }
+
+    fn confirmed(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|state| state.confirmed)
+            .unwrap_or(false)
+    }
+
+    fn confirm(&self) -> bool {
+        let Ok(mut state) = self.inner.lock() else {
+            return false;
+        };
+        if state.confirmed {
+            return false;
+        }
+        state.confirmed = true;
+        true
+    }
+
+    fn send_motion_if_confirmed(&self, dx: i32, dy: i32, path: &'static str) -> Result<bool> {
+        if !self.confirmed() {
+            return Ok(false);
+        }
+        self.send_motion(dx, dy, path)?;
+        Ok(true)
+    }
+
+    fn send_motion(&self, dx: i32, dy: i32, path: &'static str) -> Result<()> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow!("udp motion writer lock poisoned"))?;
         let packet = MotionDatagram {
-            seq: self.seq,
+            seq: state.seq,
             dx: dx.clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH),
             dy: dy.clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH),
         };
         let encoded = packet.encode();
         let started = Instant::now();
-        self.socket
+        let sent = state
+            .socket
             .send(&encoded)
-            .await
             .context("send udp motion packet")?;
+        if sent != encoded.len() {
+            bail!("short udp motion send: {sent}/{}", encoded.len());
+        }
         let elapsed = started.elapsed();
         if latency::report(elapsed) {
             info!(
                 target: "softkvm::latency",
+                path,
                 seq = packet.seq,
                 dx = packet.dx,
                 dy = packet.dy,
@@ -208,7 +287,7 @@ impl UdpMotionWriter {
                 "windows udp motion send latency"
             );
         }
-        self.seq = self.seq.wrapping_add(1);
+        state.seq = state.seq.wrapping_add(1);
         Ok(())
     }
 }
@@ -580,6 +659,8 @@ async fn control_reader_task(stream: OwnedReadHalf) {
 }
 
 fn run_message_loop() -> Result<()> {
+    prepare_low_latency_thread("Raw Input message loop");
+
     let hwnd = unsafe { create_message_window()? };
     let setup = unsafe { register_input(hwnd).and_then(|_| register_hotkey(hwnd)) }
         .and_then(|_| install_persistent_hooks());
@@ -848,6 +929,18 @@ fn handle_mouse(raw: RAWINPUT) -> Result<()> {
             if activated_this_packet && let InputEvent::MouseMotion { dx, dy } = event {
                 state.send(HostCommand::InputImmediate(clamp_activation_motion(dx, dy)))?;
                 continue;
+            }
+            if let InputEvent::MouseMotion { dx, dy } = event {
+                match state.send_direct_motion(dx, dy) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            "direct udp motion send failed; falling back to host writer"
+                        );
+                    }
+                }
             }
             state.send(HostCommand::Input(event))?;
         }
@@ -1166,6 +1259,7 @@ enum HostCommand {
 
 struct HostState {
     tx: mpsc::UnboundedSender<HostCommand>,
+    direct_motion: Option<SharedUdpMotionWriter>,
     remote_active: bool,
     layout: String,
     pressed_modifier_keys: HashSet<u16>,
@@ -1179,9 +1273,14 @@ struct HostState {
 }
 
 impl HostState {
-    fn new(tx: mpsc::UnboundedSender<HostCommand>, layout: String) -> Self {
+    fn new(
+        tx: mpsc::UnboundedSender<HostCommand>,
+        layout: String,
+        direct_motion: Option<SharedUdpMotionWriter>,
+    ) -> Self {
         Self {
             tx,
+            direct_motion,
             remote_active: false,
             layout,
             pressed_modifier_keys: HashSet::new(),
@@ -1288,6 +1387,13 @@ impl HostState {
         self.tx
             .send(command)
             .map_err(|_| anyhow!("host writer task is gone"))
+    }
+
+    fn send_direct_motion(&self, dx: i32, dy: i32) -> Result<bool> {
+        let Some(writer) = &self.direct_motion else {
+            return Ok(false);
+        };
+        writer.send_motion_if_confirmed(dx, dy, "direct")
     }
 
     fn keyboard_events(&mut self, vkey: u16, key_state: KeyState) -> Vec<InputEvent> {

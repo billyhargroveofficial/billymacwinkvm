@@ -43,6 +43,27 @@ pub enum Command {
         peer: String,
     },
 
+    /// Send timed synthetic motion for latency/jitter diagnosis.
+    MotionBench {
+        #[arg(long)]
+        peer: String,
+
+        #[arg(long, value_enum, default_value_t = BenchTransport::Udp)]
+        transport: BenchTransport,
+
+        #[arg(long, value_enum, default_value_t = BenchTiming::Spin)]
+        timing: BenchTiming,
+
+        #[arg(long, default_value_t = 200)]
+        hz: u32,
+
+        #[arg(long, default_value_t = 8)]
+        seconds: u32,
+
+        #[arg(long, default_value_t = 8)]
+        dx: i32,
+    },
+
     /// Run Windows host capture.
     Host {
         #[arg(long)]
@@ -58,4 +79,16 @@ pub enum SinkKind {
     Log,
     Karabiner,
     NativeHid,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum BenchTransport {
+    Tcp,
+    Udp,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum BenchTiming {
+    Sleep,
+    Spin,
 }
