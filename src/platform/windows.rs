@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::{Mutex, OnceLock};
@@ -77,6 +77,7 @@ async fn writer_task(stream: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Hos
     let mut writer = FrameWriter::new(stream);
     let session_id = Uuid::new_v4();
     let mut seq = 1_u64;
+    let mut pending = VecDeque::new();
 
     if let Err(err) = writer
         .write_frame(Frame::new(
@@ -98,7 +99,11 @@ async fn writer_task(stream: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Hos
     }
     seq += 1;
 
-    while let Some(command) = rx.recv().await {
+    loop {
+        let Some(command) = next_host_command(&mut rx, &mut pending).await else {
+            break;
+        };
+        let command = coalesce_host_command(command, &mut rx, &mut pending);
         let message = match command {
             HostCommand::HostState { active, reason } => Message::HostState(HostStateEvent {
                 remote_active: active,
@@ -117,6 +122,45 @@ async fn writer_task(stream: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Hos
         }
         seq += 1;
     }
+}
+
+async fn next_host_command(
+    rx: &mut mpsc::UnboundedReceiver<HostCommand>,
+    pending: &mut VecDeque<HostCommand>,
+) -> Option<HostCommand> {
+    match pending.pop_front() {
+        Some(command) => Some(command),
+        None => rx.recv().await,
+    }
+}
+
+fn coalesce_host_command(
+    command: HostCommand,
+    rx: &mut mpsc::UnboundedReceiver<HostCommand>,
+    pending: &mut VecDeque<HostCommand>,
+) -> HostCommand {
+    let HostCommand::Input(InputEvent::MouseMotion { mut dx, mut dy }) = command else {
+        return command;
+    };
+
+    loop {
+        match rx.try_recv() {
+            Ok(HostCommand::Input(InputEvent::MouseMotion {
+                dx: next_dx,
+                dy: next_dy,
+            })) => {
+                dx += next_dx;
+                dy += next_dy;
+            }
+            Ok(other) => {
+                pending.push_back(other);
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+
+    HostCommand::Input(InputEvent::MouseMotion { dx, dy })
 }
 
 async fn control_reader_task(stream: OwnedReadHalf) {
@@ -334,17 +378,15 @@ unsafe fn read_raw_input(lparam: LPARAM) -> Result<RAWINPUT> {
     if probe == u32::MAX {
         return Err(windows::core::Error::from_thread()).context("GetRawInputData size");
     }
-    if size < size_of::<RAWINPUT>() as u32 {
-        bail!("raw input packet is too small: {size}");
-    }
 
-    let mut data = vec![0_u8; size as usize];
+    let mut buffer_size = size.max(size_of::<RAWINPUT>() as u32);
+    let mut data = vec![0_u8; buffer_size as usize];
     let read = unsafe {
         GetRawInputData(
             handle,
             RID_INPUT,
             Some(data.as_mut_ptr().cast::<c_void>()),
-            &mut size,
+            &mut buffer_size,
             header_size,
         )
     };
@@ -352,7 +394,7 @@ unsafe fn read_raw_input(lparam: LPARAM) -> Result<RAWINPUT> {
         return Err(windows::core::Error::from_thread()).context("GetRawInputData body");
     }
 
-    Ok(unsafe { *(data.as_ptr().cast::<RAWINPUT>()) })
+    Ok(unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<RAWINPUT>()) })
 }
 
 fn handle_mouse(raw: RAWINPUT) -> Result<()> {
@@ -505,7 +547,15 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
         let message = wparam.0 as u32;
         if message == WM_KEYDOWN || message == WM_SYSKEYDOWN {
             let key = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-            if is_backslash_key(key.vkCode as u16, key.scanCode) && ctrl_alt_down() {
+            let ctrl_alt = ctrl_alt_down();
+            if remote_is_active() && ctrl_alt {
+                info!(
+                    vkey = key.vkCode,
+                    scan_code = key.scanCode,
+                    "remote Ctrl+Alt keydown"
+                );
+            }
+            if is_backslash_key(key.vkCode as u16, key.scanCode) && ctrl_alt {
                 if let Err(err) = toggle_remote("hotkey Ctrl+Alt+\\") {
                     error!(?err, "toggle failed");
                 }
