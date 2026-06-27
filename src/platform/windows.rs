@@ -610,6 +610,12 @@ struct SharedUdpMotionWriter {
     pending_dy: Arc<AtomicI32>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UdpSendMode {
+    Immediate,
+    Coalesced,
+}
+
 impl SharedUdpMotionWriter {
     fn new(socket: StdUdpSocket) -> Self {
         let writer = Self {
@@ -636,10 +642,13 @@ impl SharedUdpMotionWriter {
             return Ok(false);
         }
         if path == "direct" || path == "writer" {
-            self.queue_motion(dx, dy);
-        } else {
-            self.send_motion(dx, dy, path)?;
+            match udp_send_mode() {
+                UdpSendMode::Immediate => self.send_motion_immediate(dx, dy, "direct-immediate")?,
+                UdpSendMode::Coalesced => self.queue_motion(dx, dy),
+            }
+            return Ok(true);
         }
+        self.send_motion(dx, dy, path)?;
         Ok(true)
     }
 
@@ -707,6 +716,24 @@ impl SharedUdpMotionWriter {
             })
             .expect("spawn UDP motion sender thread");
     }
+}
+
+fn udp_send_mode() -> UdpSendMode {
+    static MODE: OnceLock<UdpSendMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("SOFTKVM_UDP_SEND_MODE")
+            .unwrap_or_else(|_| "immediate".to_owned())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "immediate" | "direct" => UdpSendMode::Immediate,
+            "coalesced" | "batch" | "sender-thread" => UdpSendMode::Coalesced,
+            other => {
+                warn!(value = other, "unknown SOFTKVM_UDP_SEND_MODE; using immediate");
+                UdpSendMode::Immediate
+            }
+        }
+    })
 }
 
 fn accumulate_i32(cell: &AtomicI32, delta: i32) {

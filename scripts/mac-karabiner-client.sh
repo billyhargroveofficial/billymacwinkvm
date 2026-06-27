@@ -40,9 +40,10 @@ echo
 echo "Starting real macOS input receiver through $SINK."
 echo "Leave this terminal open. Stop with Ctrl+C."
 sudo env \
-  RUST_LOG="${RUST_LOG:-softkvm=info,softkvm::latency=warn}" \
+  RUST_LOG="${RUST_LOG:-softkvm=info,softkvm::latency=info}" \
   SOFTKVM_MAC_MODIFIER_POLICY="${SOFTKVM_MAC_MODIFIER_POLICY:-swap-alt-super}" \
   SOFTKVM_CGEVENT_POINTER_SPEED="${SOFTKVM_CGEVENT_POINTER_SPEED:-1.0}" \
+  SOFTKVM_CGEVENT_MOTION_METHOD="${SOFTKVM_CGEVENT_MOTION_METHOD:-warp}" \
   SOFTKVM_MAC_MOTION_MODE="${SOFTKVM_MAC_MOTION_MODE:-direct}" \
   SOFTKVM_LATENCY_LOG="${SOFTKVM_LATENCY_LOG:-0}" \
   SOFTKVM_LATENCY_WARN_MS="${SOFTKVM_LATENCY_WARN_MS:-8}" \

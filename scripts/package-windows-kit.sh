@@ -84,11 +84,13 @@ Check the exact build:
 
 .\\softkvm.exe build-info
 
-Current default host path uses buffered Raw Input and a separate UDP motion
-sender thread to reduce visible freeze/burst tails. Emergency fallback to the
-old one-by-one Raw Input reader:
+Current default host path uses buffered Raw Input and immediate binary UDP
+motion sends. Fallbacks:
 
 \$env:SOFTKVM_RAW_INPUT_READER="lparam"
+.\\scripts\\windows-real-preflight.ps1 -Exe .\\softkvm.exe -Peer "<mac-ip>:49321" -RunHost
+
+\$env:SOFTKVM_UDP_SEND_MODE="coalesced"
 .\\scripts\\windows-real-preflight.ps1 -Exe .\\softkvm.exe -Peer "<mac-ip>:49321" -RunHost
 
 Diagnose real Windows mouse cadence before involving macOS:

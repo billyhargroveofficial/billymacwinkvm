@@ -115,6 +115,9 @@ static CGEVENT_POINTING_BUTTONS: AtomicU32 = AtomicU32::new(0);
 static CGEVENT_CURSOR_POSITION: std::sync::Mutex<Option<CGPoint>> = std::sync::Mutex::new(None);
 #[cfg(target_os = "macos")]
 static CGEVENT_POINTER_SPEED: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+#[cfg(target_os = "macos")]
+static CGEVENT_MOTION_METHOD: std::sync::OnceLock<CgEventMotionMethod> =
+    std::sync::OnceLock::new();
 
 #[cfg(unix)]
 pub async fn karabiner_sink_async() -> Result<Box<dyn HidSink>> {
@@ -154,6 +157,19 @@ pub fn cgevent_note_cursor_position(x: f64, y: f64) {
 }
 
 #[cfg(target_os = "macos")]
+pub fn cgevent_cached_cursor_position() -> Option<(f64, f64)> {
+    let position = CGEVENT_CURSOR_POSITION.lock().ok()?;
+    position.map(|point| (point.x, point.y))
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CgEventMotionMethod {
+    Warp,
+    Event,
+}
+
+#[cfg(target_os = "macos")]
 struct CgEventSink {
     buttons: u32,
     modifiers: u64,
@@ -165,9 +181,11 @@ impl CgEventSink {
     async fn connect() -> Result<Self> {
         let modifier_policy = MacModifierPolicy::from_env();
         let pointer_speed = cgevent_pointer_speed();
+        let motion_method = cgevent_motion_method();
         info!(
             ?modifier_policy,
             pointer_speed,
+            ?motion_method,
             scroll_inverted = true,
             "using CGEvent mouse and keyboard sink"
         );
@@ -231,7 +249,29 @@ impl CgEventSink {
         } else {
             CG_EVENT_MOUSE_MOVED
         };
+        if buttons == 0 && cgevent_motion_method() == CgEventMotionMethod::Warp {
+            return Self::post_warp_motion(point);
+        }
         self.post_mouse_event(event_type, point, CG_MOUSE_BUTTON_LEFT)
+    }
+
+    fn post_warp_motion(point: CGPoint) -> Result<()> {
+        let started = Instant::now();
+        let status = unsafe { CGWarpMouseCursorPosition(point) };
+        let elapsed = started.elapsed();
+        if status != 0 {
+            bail!("CGWarpMouseCursorPosition failed: {status}");
+        }
+        if latency::report(elapsed) {
+            info!(
+                target: "softkvm::latency",
+                x = point.x,
+                y = point.y,
+                elapsed_ms = latency::ms(elapsed),
+                "cgevent warp motion latency"
+            );
+        }
+        Ok(())
     }
 
     fn post_button(&mut self, button: MouseButton, state: KeyState) -> Result<()> {
@@ -713,6 +753,7 @@ unsafe extern "C" {
         key_down: bool,
     ) -> *mut std::ffi::c_void;
     fn CGEventSetFlags(event: *mut std::ffi::c_void, flags: u64);
+    fn CGWarpMouseCursorPosition(new_cursor_position: CGPoint) -> i32;
     fn CGEventPost(tap: u32, event: *mut std::ffi::c_void);
     fn CFRelease(cf: *const std::ffi::c_void);
 }
@@ -891,6 +932,24 @@ fn cgevent_pointer_speed() -> f64 {
             .filter(|value| value.is_finite())
             .unwrap_or(1.0)
             .clamp(0.05, 4.0)
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn cgevent_motion_method() -> CgEventMotionMethod {
+    *CGEVENT_MOTION_METHOD.get_or_init(|| {
+        match std::env::var("SOFTKVM_CGEVENT_MOTION_METHOD")
+            .unwrap_or_else(|_| "warp".to_owned())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "event" | "mouse-event" | "cgevent" => CgEventMotionMethod::Event,
+            "warp" | "cursor-warp" => CgEventMotionMethod::Warp,
+            other => {
+                warn!(value = other, "unknown SOFTKVM_CGEVENT_MOTION_METHOD; using warp");
+                CgEventMotionMethod::Warp
+            }
+        }
     })
 }
 

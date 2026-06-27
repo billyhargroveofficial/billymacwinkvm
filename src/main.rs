@@ -78,6 +78,8 @@ fn build_info() -> Result<()> {
     );
     println!("mac_motion_mode default=cg-event:direct,other:coalesced env=SOFTKVM_MAC_MOTION_MODE");
     println!("cgevent_pointer_speed default=1.0 env=SOFTKVM_CGEVENT_POINTER_SPEED");
+    println!("cgevent_motion_method default=warp env=SOFTKVM_CGEVENT_MOTION_METHOD");
+    println!("windows_udp_send_mode default=immediate env=SOFTKVM_UDP_SEND_MODE");
     Ok(())
 }
 
@@ -470,14 +472,12 @@ async fn start_mac_motion_tasks(
     let motion_sink = make_sink(sink).await?;
     match mac_motion_mode(sink) {
         MacMotionMode::Direct => {
-            let (packet_tx, packet_rx) = mpsc::unbounded_channel();
             info!("using direct mac UDP motion mode");
-            tokio::spawn(mac_udp_motion_direct_reader_task(socket, packet_tx));
-            tokio::spawn(mac_direct_motion_writer_task(
+            tokio::spawn(mac_udp_motion_direct_task(
+                socket,
                 motion_sink,
                 sink,
                 shared,
-                packet_rx,
                 event_tx,
             ));
         }
@@ -518,64 +518,51 @@ fn default_mac_motion_mode(sink: SinkKind) -> MacMotionMode {
     }
 }
 
-async fn mac_udp_motion_direct_reader_task(
+async fn mac_udp_motion_direct_task(
     socket: UdpSocket,
-    packet_tx: mpsc::UnboundedSender<MotionDatagram>,
-) {
-    let mut buffer = [0_u8; MOTION_DATAGRAM_LEN];
-    loop {
-        match socket.recv_from(&mut buffer).await {
-            Ok((len, addr)) => {
-                let Some(packet) = MotionDatagram::decode(&buffer[..len]) else {
-                    if latency::enabled() {
-                        warn!(%addr, len, "ignored malformed udp motion packet");
-                    }
-                    continue;
-                };
-                if packet_tx.send(packet).is_err() {
-                    break;
-                }
-            }
-            Err(err) => {
-                warn!(?err, "udp motion reader failed");
-                break;
-            }
-        }
-    }
-}
-
-async fn mac_udp_motion_accumulator_task(socket: UdpSocket, shared: Arc<MacMotionShared>) {
-    let mut buffer = [0_u8; MOTION_DATAGRAM_LEN];
-    loop {
-        match socket.recv_from(&mut buffer).await {
-            Ok((len, addr)) => {
-                let Some(packet) = MotionDatagram::decode(&buffer[..len]) else {
-                    if latency::enabled() {
-                        warn!(%addr, len, "ignored malformed udp motion packet");
-                    }
-                    continue;
-                };
-                shared.queue_motion(packet);
-            }
-            Err(err) => {
-                warn!(?err, "udp motion reader failed");
-                break;
-            }
-        }
-    }
-}
-
-async fn mac_direct_motion_writer_task(
     mut motion_sink: Box<dyn HidSink>,
     sink: SinkKind,
     shared: Arc<MacMotionShared>,
-    mut packet_rx: mpsc::UnboundedReceiver<MotionDatagram>,
     event_tx: mpsc::UnboundedSender<MacMotionEvent>,
 ) {
+    let mut buffer = [0_u8; MOTION_DATAGRAM_LEN];
     let mut right_edge_release_armed = false;
     let mut was_active = false;
+    let mut last_recv_at: Option<Instant> = None;
+    let mut last_seq: Option<u64> = None;
 
-    while let Some(packet) = packet_rx.recv().await {
+    loop {
+        let (len, addr) = match socket.recv_from(&mut buffer).await {
+            Ok(result) => result,
+            Err(err) => {
+                warn!(?err, "udp motion reader failed");
+                break;
+            }
+        };
+        let received_at = Instant::now();
+        let Some(packet) = MotionDatagram::decode(&buffer[..len]) else {
+            if latency::enabled() {
+                warn!(%addr, len, "ignored malformed udp motion packet");
+            }
+            continue;
+        };
+
+        if let Some(previous) = last_recv_at {
+            let gap = received_at.saturating_duration_since(previous);
+            if latency::report(gap) {
+                info!(
+                    target: "softkvm::latency",
+                    seq = packet.seq,
+                    previous_seq = last_seq,
+                    seq_gap = last_seq.map(|seq| packet.seq.saturating_sub(seq)),
+                    gap_ms = latency::ms(gap),
+                    "mac udp motion receive gap"
+                );
+            }
+        }
+        last_recv_at = Some(received_at);
+        last_seq = Some(packet.seq);
+
         let active = shared.remote_active.load(Ordering::Acquire);
         if active != was_active {
             right_edge_release_armed = false;
@@ -624,6 +611,27 @@ async fn mac_direct_motion_writer_task(
                 let _ = event_tx.send(MacMotionEvent::ReleaseHost {
                     entry_y_ratio: Some(y_ratio),
                 });
+            }
+        }
+    }
+}
+
+async fn mac_udp_motion_accumulator_task(socket: UdpSocket, shared: Arc<MacMotionShared>) {
+    let mut buffer = [0_u8; MOTION_DATAGRAM_LEN];
+    loop {
+        match socket.recv_from(&mut buffer).await {
+            Ok((len, addr)) => {
+                let Some(packet) = MotionDatagram::decode(&buffer[..len]) else {
+                    if latency::enabled() {
+                        warn!(%addr, len, "ignored malformed udp motion packet");
+                    }
+                    continue;
+                };
+                shared.queue_motion(packet);
+            }
+            Err(err) => {
+                warn!(?err, "udp motion reader failed");
+                break;
             }
         }
     }
@@ -1089,13 +1097,16 @@ unsafe extern "C" {
 
 #[cfg(target_os = "macos")]
 unsafe fn mac_cursor_and_main_display_bounds() -> Option<(CGPoint, CGRect)> {
+    let bounds = unsafe { CGDisplayBounds(CGMainDisplayID()) };
+    if let Some((x, y)) = crate::hid::cgevent_cached_cursor_position() {
+        return Some((CGPoint { x, y }, bounds));
+    }
     let event = unsafe { CGEventCreate(std::ptr::null()) };
     if event.is_null() {
         return None;
     }
     let cursor = unsafe { CGEventGetLocation(event) };
     unsafe { CFRelease(event.cast_const()) };
-    let bounds = unsafe { CGDisplayBounds(CGMainDisplayID()) };
     Some((cursor, bounds))
 }
 
