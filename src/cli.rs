@@ -88,6 +88,7 @@ pub enum SinkKind {
     Log,
     Karabiner,
     NativeHid,
+    CgEvent,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]

@@ -131,6 +131,141 @@ pub async fn native_hid_sink_async() -> Result<Box<dyn HidSink>> {
 }
 
 #[cfg(target_os = "macos")]
+pub async fn cgevent_sink_async() -> Result<Box<dyn HidSink>> {
+    Ok(Box::new(CgEventSink::connect().await?))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub async fn cgevent_sink_async() -> Result<Box<dyn HidSink>> {
+    anyhow::bail!("CGEvent sink is macOS-only")
+}
+
+#[cfg(target_os = "macos")]
+struct CgEventSink {
+    buttons: u32,
+    keyboard: Box<dyn HidSink>,
+}
+
+#[cfg(target_os = "macos")]
+impl CgEventSink {
+    async fn connect() -> Result<Self> {
+        info!("using CGEvent mouse sink with Karabiner keyboard fallback");
+        Ok(Self {
+            buttons: 0,
+            keyboard: karabiner_sink_async().await?,
+        })
+    }
+
+    fn current_position() -> Option<CGPoint> {
+        let event = unsafe { CGEventCreate(std::ptr::null()) };
+        if event.is_null() {
+            return None;
+        }
+        let point = unsafe { CGEventGetLocation(event) };
+        unsafe { CFRelease(event.cast_const()) };
+        Some(point)
+    }
+
+    fn post_motion(&self, dx: i32, dy: i32) -> Result<()> {
+        let Some(current) = Self::current_position() else {
+            bail!("CGEventCreate returned null while reading mouse position");
+        };
+        let point = CGPoint {
+            x: current.x + f64::from(dx),
+            y: current.y + f64::from(dy),
+        };
+        let event_type = if self.buttons & mouse_button_bit(MouseButton::Left) != 0 {
+            CG_EVENT_LEFT_MOUSE_DRAGGED
+        } else if self.buttons & mouse_button_bit(MouseButton::Right) != 0 {
+            CG_EVENT_RIGHT_MOUSE_DRAGGED
+        } else if self.buttons != 0 {
+            CG_EVENT_OTHER_MOUSE_DRAGGED
+        } else {
+            CG_EVENT_MOUSE_MOVED
+        };
+        self.post_mouse_event(event_type, point, CG_MOUSE_BUTTON_LEFT)
+    }
+
+    fn post_button(&mut self, button: MouseButton, state: KeyState) -> Result<()> {
+        let bit = mouse_button_bit(button);
+        match state {
+            KeyState::Down => self.buttons |= bit,
+            KeyState::Up => self.buttons &= !bit,
+        }
+        let Some(point) = Self::current_position() else {
+            bail!("CGEventCreate returned null while reading mouse position");
+        };
+        let (event_type, cg_button) = match (button, state) {
+            (MouseButton::Left, KeyState::Down) => (CG_EVENT_LEFT_MOUSE_DOWN, CG_MOUSE_BUTTON_LEFT),
+            (MouseButton::Left, KeyState::Up) => (CG_EVENT_LEFT_MOUSE_UP, CG_MOUSE_BUTTON_LEFT),
+            (MouseButton::Right, KeyState::Down) => {
+                (CG_EVENT_RIGHT_MOUSE_DOWN, CG_MOUSE_BUTTON_RIGHT)
+            }
+            (MouseButton::Right, KeyState::Up) => (CG_EVENT_RIGHT_MOUSE_UP, CG_MOUSE_BUTTON_RIGHT),
+            (MouseButton::Middle, KeyState::Down) => {
+                (CG_EVENT_OTHER_MOUSE_DOWN, CG_MOUSE_BUTTON_CENTER)
+            }
+            (MouseButton::Middle, KeyState::Up) => {
+                (CG_EVENT_OTHER_MOUSE_UP, CG_MOUSE_BUTTON_CENTER)
+            }
+            (MouseButton::Back | MouseButton::Forward, KeyState::Down) => {
+                (CG_EVENT_OTHER_MOUSE_DOWN, CG_MOUSE_BUTTON_CENTER)
+            }
+            (MouseButton::Back | MouseButton::Forward, KeyState::Up) => {
+                (CG_EVENT_OTHER_MOUSE_UP, CG_MOUSE_BUTTON_CENTER)
+            }
+        };
+        self.post_mouse_event(event_type, point, cg_button)
+    }
+
+    fn post_mouse_event(&self, event_type: u32, point: CGPoint, button: u32) -> Result<()> {
+        let event = unsafe { CGEventCreateMouseEvent(std::ptr::null(), event_type, point, button) };
+        if event.is_null() {
+            bail!("CGEventCreateMouseEvent returned null");
+        }
+        unsafe {
+            CGEventPost(CG_HID_EVENT_TAP, event);
+            CFRelease(event.cast_const());
+        }
+        Ok(())
+    }
+
+    fn post_wheel(&self, dx: i32, dy: i32) -> Result<()> {
+        let event = unsafe {
+            CGEventCreateScrollWheelEvent(std::ptr::null(), CG_SCROLL_EVENT_UNIT_LINE, 2, dy, dx, 0)
+        };
+        if event.is_null() {
+            bail!("CGEventCreateScrollWheelEvent returned null");
+        }
+        unsafe {
+            CGEventPost(CG_HID_EVENT_TAP, event);
+            CFRelease(event.cast_const());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[async_trait::async_trait]
+impl HidSink for CgEventSink {
+    async fn apply(&mut self, event: InputEvent) -> Result<()> {
+        match event {
+            InputEvent::MouseMotion { dx, dy } => self.post_motion(dx, dy),
+            InputEvent::MouseWheel { dx, dy } => self.post_wheel(dx, dy),
+            InputEvent::MouseButton { button, state } => self.post_button(button, state),
+            InputEvent::Modifier { .. } | InputEvent::Key { .. } => {
+                self.keyboard.apply(event).await
+            }
+        }
+    }
+
+    async fn reset(&mut self) -> Result<()> {
+        self.buttons = 0;
+        self.keyboard.reset().await
+    }
+}
+
+#[cfg(target_os = "macos")]
 struct NativeHidSink {
     mouse: NativeHidUserDevice,
     keyboard: NativeHidUserDevice,
@@ -400,6 +535,68 @@ unsafe extern "C" {
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn mach_absolute_time() -> u64;
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGPoint {
+    x: f64,
+    y: f64,
+}
+
+#[cfg(target_os = "macos")]
+const CG_HID_EVENT_TAP: u32 = 0;
+#[cfg(target_os = "macos")]
+const CG_EVENT_LEFT_MOUSE_DOWN: u32 = 1;
+#[cfg(target_os = "macos")]
+const CG_EVENT_LEFT_MOUSE_UP: u32 = 2;
+#[cfg(target_os = "macos")]
+const CG_EVENT_RIGHT_MOUSE_DOWN: u32 = 3;
+#[cfg(target_os = "macos")]
+const CG_EVENT_RIGHT_MOUSE_UP: u32 = 4;
+#[cfg(target_os = "macos")]
+const CG_EVENT_MOUSE_MOVED: u32 = 5;
+#[cfg(target_os = "macos")]
+const CG_EVENT_LEFT_MOUSE_DRAGGED: u32 = 6;
+#[cfg(target_os = "macos")]
+const CG_EVENT_RIGHT_MOUSE_DRAGGED: u32 = 7;
+#[cfg(target_os = "macos")]
+const CG_EVENT_OTHER_MOUSE_DOWN: u32 = 25;
+#[cfg(target_os = "macos")]
+const CG_EVENT_OTHER_MOUSE_UP: u32 = 26;
+#[cfg(target_os = "macos")]
+const CG_EVENT_OTHER_MOUSE_DRAGGED: u32 = 27;
+#[cfg(target_os = "macos")]
+const CG_MOUSE_BUTTON_LEFT: u32 = 0;
+#[cfg(target_os = "macos")]
+const CG_MOUSE_BUTTON_RIGHT: u32 = 1;
+#[cfg(target_os = "macos")]
+const CG_MOUSE_BUTTON_CENTER: u32 = 2;
+#[cfg(target_os = "macos")]
+const CG_SCROLL_EVENT_UNIT_LINE: u32 = 1;
+
+#[cfg(target_os = "macos")]
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn CGEventCreate(source: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+    fn CGEventGetLocation(event: *mut std::ffi::c_void) -> CGPoint;
+    fn CGEventCreateMouseEvent(
+        source: *const std::ffi::c_void,
+        mouse_type: u32,
+        mouse_cursor_position: CGPoint,
+        mouse_button: u32,
+    ) -> *mut std::ffi::c_void;
+    fn CGEventCreateScrollWheelEvent(
+        source: *const std::ffi::c_void,
+        units: u32,
+        wheel_count: u32,
+        wheel1: i32,
+        wheel2: i32,
+        wheel3: i32,
+    ) -> *mut std::ffi::c_void;
+    fn CGEventPost(tap: u32, event: *mut std::ffi::c_void);
+    fn CFRelease(cf: *const std::ffi::c_void);
 }
 
 #[cfg(target_os = "macos")]

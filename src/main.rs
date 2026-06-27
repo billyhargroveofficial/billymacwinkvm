@@ -826,6 +826,7 @@ async fn make_sink(sink: SinkKind) -> Result<Box<dyn HidSink>> {
         SinkKind::Log => Ok(Box::new(LogSink::default())),
         SinkKind::Karabiner => hid::karabiner_sink_async().await,
         SinkKind::NativeHid => hid::native_hid_sink_async().await,
+        SinkKind::CgEvent => hid::cgevent_sink_async().await,
     }
 }
 
