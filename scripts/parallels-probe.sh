@@ -57,3 +57,16 @@ sleep 0.5
 echo
 echo "== Mac client log tail =="
 tail -80 "$LOG"
+
+if ! grep -q 'role: "probe"' "$LOG"; then
+  echo "Mac client did not receive probe hello." >&2
+  exit 1
+fi
+
+if ! grep -q 'MouseButton { button: Left, state: Down }' "$LOG"; then
+  echo "Mac client did not receive the synthetic left-click probe event." >&2
+  exit 1
+fi
+
+echo
+echo "PASS: Windows probe reached Mac and delivered synthetic mouse events."

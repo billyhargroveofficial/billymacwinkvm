@@ -38,10 +38,20 @@ Still missing for the final "feels native on a 200 Hz monitor" version:
 ```bash
 cargo build
 cargo test
+./scripts/test-local.sh
 cargo run -- mac-hid-probe
 cargo run -- client --listen 127.0.0.1:49321 --sink log
 cargo run -- probe --peer 127.0.0.1:49321
 ./scripts/parallels-probe.sh
+./scripts/parallels-host-smoke.sh
+./scripts/test-parallels.sh
+./scripts/mac-log-client.sh
+```
+
+Real Windows preflight:
+
+```powershell
+.\scripts\windows-real-preflight.ps1 -Exe .\softkvm.exe -Peer <mac-lan-ip>:49321
 ```
 
 ## Docs
@@ -50,3 +60,4 @@ cargo run -- probe --peer 127.0.0.1:49321
 - `docs/mac-virtual-hid.md`
 - `docs/windows-host.md`
 - `docs/dev-setup.md`
+- `docs/test-plan.md`
