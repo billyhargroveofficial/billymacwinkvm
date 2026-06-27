@@ -9,6 +9,8 @@ use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
+use std::time::Instant;
+#[cfg(unix)]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -428,8 +430,21 @@ impl KarabinerClient {
             wire.extend_from_slice(&len.to_be_bytes());
             wire.extend_from_slice(&body);
         }
+        let bytes = wire.len();
+        let lock_started = Instant::now();
         let mut writer = self.writer.lock().await;
+        let lock_elapsed = lock_started.elapsed();
+        let write_started = Instant::now();
         writer.write_all(&wire).await?;
+        let write_elapsed = write_started.elapsed();
+        if lock_elapsed >= Duration::from_millis(5) || write_elapsed >= Duration::from_millis(10) {
+            warn!(
+                bytes,
+                lock_ms = lock_elapsed.as_millis(),
+                write_ms = write_elapsed.as_millis(),
+                "Karabiner write was slow"
+            );
+        }
         Ok(())
     }
 }

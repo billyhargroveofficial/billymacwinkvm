@@ -56,7 +56,7 @@ const HOTKEY_DEBOUNCE_MS: u64 = 250;
 const MOUSE_FLUSH_INTERVAL_MS: u64 = 4;
 const MAX_MOTION_DRAIN_PER_TURN: usize = 64;
 const MAX_MOTION_DELTA_PER_FLUSH: i32 = 512;
-const MAC_ENTRY_X_RATIO_FROM_WINDOWS: f64 = 0.98;
+const MAC_ENTRY_X_RATIO_FROM_WINDOWS: f64 = 1.0;
 const WINDOWS_RESTORE_EDGE_INSET_PX: i32 = 32;
 const WHEEL_DELTA: i32 = 120;
 const SCANCODE_BACKSLASH: u32 = 0x2b;
@@ -348,7 +348,7 @@ async fn control_reader_task(stream: OwnedReadHalf) {
 fn run_message_loop() -> Result<()> {
     let hwnd = unsafe { create_message_window()? };
     let setup = unsafe { register_input(hwnd).and_then(|_| register_hotkey(hwnd)) }
-        .and_then(|_| install_persistent_keyboard_hook());
+        .and_then(|_| install_persistent_hooks());
 
     if let Err(err) = setup {
         unsafe {
@@ -769,10 +769,11 @@ fn release_host_state_after_transport_loss(reason: &'static str) {
     }
 }
 
-fn install_persistent_keyboard_hook() -> Result<()> {
+fn install_persistent_hooks() -> Result<()> {
     let mut state = lock_state()?;
+    state.install_mouse_hook()?;
     state.install_keyboard_hook()?;
-    info!("persistent Windows keyboard hook is ready for Ctrl+(Alt|Win)+\\");
+    info!("persistent Windows input hooks are ready for remote suppression and Ctrl+(Alt|Win)+\\");
     Ok(())
 }
 
@@ -991,6 +992,12 @@ impl HostState {
                 self.release_local_controls(true, None, None);
                 return Err(err);
             }
+            if let Err(err) = self.send_current_modifier_state() {
+                self.remote_active = false;
+                REMOTE_ACTIVE_FAST.store(false, Ordering::Relaxed);
+                self.release_local_controls(true, None, None);
+                return Err(err);
+            }
             info!(reason, "remote macOS control enabled");
         } else {
             self.remote_active = false;
@@ -1052,6 +1059,40 @@ impl HostState {
         }
     }
 
+    fn send_current_modifier_state(&mut self) -> Result<()> {
+        for event in self.seed_current_modifier_state() {
+            self.send(HostCommand::InputImmediate(event))?;
+        }
+        Ok(())
+    }
+
+    fn seed_current_modifier_state(&mut self) -> Vec<InputEvent> {
+        let mut events = Vec::new();
+
+        for (modifier, vkeys) in [
+            (Modifier::Control, [VK_LCONTROL.0, VK_RCONTROL.0]),
+            (Modifier::Alt, [VK_LMENU.0, VK_RMENU.0]),
+            (Modifier::Super, [VK_LWIN.0, VK_RWIN.0]),
+            (Modifier::Shift, [VK_LSHIFT.0, VK_RSHIFT.0]),
+        ] {
+            let mut modifier_down = false;
+            for vkey in vkeys {
+                if key_down(vkey) {
+                    self.pressed_modifier_keys.insert(vkey);
+                    modifier_down = true;
+                }
+            }
+            if modifier_down && self.active_modifiers.insert(modifier) {
+                events.push(InputEvent::Modifier {
+                    modifier,
+                    state: KeyState::Down,
+                });
+            }
+        }
+
+        events
+    }
+
     fn capture_local_controls(&mut self) -> Result<()> {
         let cursor = current_cursor_position().unwrap_or_else(|_| POINT {
             x: unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) },
@@ -1059,14 +1100,9 @@ impl HostState {
         });
         self.saved_cursor_pos = Some(cursor);
         self.saved_monitor_rect = monitor_rect_for_point(cursor);
-        if let Err(err) = self.install_hooks() {
-            self.uninstall_mouse_hook();
-            return Err(err);
-        }
         unsafe {
             if let Err(err) = clip_cursor_to_parking_box(cursor) {
                 release_remote_controls();
-                self.uninstall_mouse_hook();
                 return Err(err);
             }
         }
@@ -1082,7 +1118,6 @@ impl HostState {
         unsafe {
             release_remote_controls();
         }
-        self.uninstall_mouse_hook();
 
         if restore_cursor {
             let target = match (self.saved_monitor_rect, entry_x_ratio.zip(entry_y_ratio)) {
@@ -1118,11 +1153,6 @@ impl HostState {
                 self.left_edge_armed = true;
             }
         }
-    }
-
-    fn install_hooks(&mut self) -> Result<()> {
-        self.install_mouse_hook()?;
-        self.install_keyboard_hook()
     }
 
     fn install_mouse_hook(&mut self) -> Result<()> {

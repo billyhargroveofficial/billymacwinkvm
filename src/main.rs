@@ -13,6 +13,7 @@ use protocol::{
     ProtocolHello,
 };
 use std::collections::HashSet;
+use std::time::Instant;
 use tokio::net::{
     TcpStream,
     tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -24,6 +25,9 @@ use uuid::Uuid;
 
 const MAC_MOTION_FLUSH_INTERVAL_MS: u64 = 4;
 const MAC_RIGHT_EDGE_RELEASE_REARM_PX: f64 = 48.0;
+#[cfg(target_os = "macos")]
+const MAC_EDGE_ENTRY_GAP_PX: f64 = 2.0;
+const MAX_CLIENT_MOTION_DRAIN_PER_TURN: usize = 64;
 const MAX_MOTION_DELTA_PER_FLUSH: i32 = 512;
 
 #[tokio::main]
@@ -211,8 +215,8 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
                                 &mut pending_motion,
                             )
                             .await;
+                            flush_timer.reset();
                         }
-                        flush_timer.reset();
                         continue;
                     }
 
@@ -247,7 +251,6 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
                     }
 
                     apply_input(&mut hid_sink, sink, event).await;
-                    client_state.update_right_edge_release_arm();
                 }
                 Message::InputReset => {
                     touched_input = true;
@@ -319,7 +322,10 @@ fn drain_queued_motion(
     pending_motion: &mut PendingMotion,
     deferred_read_event: &mut Option<ClientReadEvent>,
 ) {
-    while let Ok(event) = frame_rx.try_recv() {
+    for _ in 0..MAX_CLIENT_MOTION_DRAIN_PER_TURN {
+        let Ok(event) = frame_rx.try_recv() else {
+            break;
+        };
         match event {
             ClientReadEvent::Frame(Frame {
                 message: Message::Input(InputEvent::MouseMotion { dx, dy }),
@@ -401,7 +407,7 @@ async fn flush_client_motion(
     }
 
     apply_input(hid_sink, sink, InputEvent::MouseMotion { dx, dy }).await;
-    client_state.update_right_edge_release_arm();
+    client_state.update_right_edge_release_arm(dx);
 
     if client_state.should_release_after_motion(dx) && mac_cursor_at_right_edge() {
         let (_, y_ratio) = mac_cursor_ratios().unwrap_or((0.0, 0.5));
@@ -502,8 +508,8 @@ impl ClientRuntimeState {
         }
     }
 
-    fn update_right_edge_release_arm(&mut self) {
-        if !self.remote_active || self.right_edge_release_armed {
+    fn update_right_edge_release_arm(&mut self, dx: i32) {
+        if !self.remote_active || self.right_edge_release_armed || dx >= 0 {
             return;
         }
         if mac_cursor_right_gap().is_some_and(|gap| gap >= MAC_RIGHT_EDGE_RELEASE_REARM_PX) {
@@ -566,9 +572,19 @@ fn position_mac_cursor(x_ratio: Option<f64>, y_ratio: Option<f64>) {
         return;
     };
     let bounds = unsafe { CGDisplayBounds(CGMainDisplayID()) };
-    let inset = 16.0;
-    let x = bounds.origin.x + (bounds.size.width - inset * 2.0) * x_ratio.clamp(0.0, 1.0) + inset;
-    let y = bounds.origin.y + (bounds.size.height - inset * 2.0) * y_ratio.clamp(0.0, 1.0) + inset;
+    let x_ratio = x_ratio.clamp(0.0, 1.0);
+    let y_ratio = y_ratio.clamp(0.0, 1.0);
+    let x = if x_ratio >= 0.999 {
+        bounds.origin.x + bounds.size.width - MAC_EDGE_ENTRY_GAP_PX
+    } else if x_ratio <= 0.001 {
+        bounds.origin.x + MAC_EDGE_ENTRY_GAP_PX
+    } else {
+        bounds.origin.x + bounds.size.width * x_ratio
+    };
+    let y = (bounds.origin.y + bounds.size.height * y_ratio).clamp(
+        bounds.origin.y + MAC_EDGE_ENTRY_GAP_PX,
+        bounds.origin.y + bounds.size.height - MAC_EDGE_ENTRY_GAP_PX,
+    );
     unsafe { CGWarpMouseCursorPosition(CGPoint { x, y }) };
 }
 
@@ -633,6 +649,7 @@ unsafe fn mac_cursor_and_main_display_bounds() -> Option<(CGPoint, CGRect)> {
 }
 
 async fn apply_input(hid_sink: &mut Box<dyn HidSink>, sink: SinkKind, event: InputEvent) {
+    let started = Instant::now();
     if let Err(err) = hid_sink.apply(event.clone()).await {
         warn!(?err, "input sink failed; reconnecting");
         match make_sink(sink).await {
@@ -645,6 +662,15 @@ async fn apply_input(hid_sink: &mut Box<dyn HidSink>, sink: SinkKind, event: Inp
             Err(reconnect_err) => {
                 warn!(?reconnect_err, "input sink reconnect failed");
             }
+        }
+    } else {
+        let elapsed = started.elapsed();
+        if elapsed >= Duration::from_millis(20) {
+            warn!(
+                elapsed_ms = elapsed.as_millis(),
+                ?event,
+                "input sink apply was slow"
+            );
         }
     }
 }
