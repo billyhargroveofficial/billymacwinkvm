@@ -10,11 +10,17 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Print build and transport details.
+    BuildInfo,
+
     /// Generate a 256-bit pairing key for later authenticated transports.
     GenPsk,
 
     /// Check whether Karabiner VirtualHID is present on macOS.
     MacHidProbe,
+
+    /// Try to create our own native macOS virtual HID device.
+    MacNativeHidProbe,
 
     /// Send a tiny no-click movement through Karabiner VirtualHID.
     MacHidSmoke,
@@ -51,4 +57,5 @@ pub enum Command {
 pub enum SinkKind {
     Log,
     Karabiner,
+    NativeHid,
 }

@@ -19,6 +19,9 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 uuid = { version = "1.11.0", features = ["v4", "serde"] }
 async-trait = "0.1.83"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.1"
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
   "Win32_Foundation",

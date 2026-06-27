@@ -32,6 +32,7 @@ cmd /c "query user 2>nul"
 Write-Host ""
 Write-Host "== Binary =="
 & $Exe --help | Select-Object -First 2
+& $Exe build-info
 if ($env:SOFTKVM_LATENCY_LOG) {
   Write-Host "Latency log: enabled"
 }

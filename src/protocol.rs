@@ -72,6 +72,7 @@ pub enum ClientControlEvent {
         #[serde(default)]
         entry_y_ratio: Option<f64>,
     },
+    UdpMotionReady,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

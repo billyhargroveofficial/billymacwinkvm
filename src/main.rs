@@ -40,14 +40,24 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::BuildInfo => build_info(),
         Command::GenPsk => gen_psk(),
         Command::MacHidProbe => mac_hid_probe(),
+        Command::MacNativeHidProbe => mac_native_hid_probe().await,
         Command::MacHidSmoke => mac_hid_smoke().await,
         Command::MacKeySmoke => mac_key_smoke().await,
         Command::Client { listen, sink } => run_client(listen, sink).await,
         Command::Probe { peer } => run_probe(peer).await,
         Command::Host { peer, layout } => run_host(peer, layout).await,
     }
+}
+
+fn build_info() -> Result<()> {
+    println!("softkvm {}", env!("CARGO_PKG_VERSION"));
+    println!("build_git_hash {}", env!("SOFTKVM_BUILD_GIT_HASH"));
+    println!("protocol_version {}", protocol::PROTOCOL_VERSION);
+    println!("motion_transport udp-binary-skm1-with-tcp-fallback");
+    Ok(())
 }
 
 fn gen_psk() -> Result<()> {
@@ -66,6 +76,23 @@ fn mac_hid_probe() -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+async fn mac_native_hid_probe() -> Result<()> {
+    let mut sink = hid::native_hid_sink_async().await?;
+    info!("native macOS virtual HID opened; sending no-click smoke movement");
+    for _ in 0..12 {
+        sink.apply(InputEvent::MouseMotion { dx: 6, dy: 0 }).await?;
+        sleep(Duration::from_millis(4)).await;
+    }
+    for _ in 0..12 {
+        sink.apply(InputEvent::MouseMotion { dx: -6, dy: 0 })
+            .await?;
+        sleep(Duration::from_millis(4)).await;
+    }
+    sink.reset().await?;
+    println!("native_hid_ready true");
     Ok(())
 }
 
@@ -184,6 +211,18 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
                     }
 
                     if !client_state.remote_active {
+                        continue;
+                    }
+                    if !client_state.udp_motion_ready_sent {
+                        send_udp_motion_ready(
+                            &mut writer,
+                            client_session_id,
+                            &mut client_seq,
+                            &mut client_state,
+                        )
+                        .await;
+                    }
+                    if motion.packet.dx == 0 && motion.packet.dy == 0 {
                         continue;
                     }
                     touched_input = true;
@@ -492,12 +531,39 @@ async fn request_host_release(
     reset_input(hid_sink, sink).await;
 }
 
+async fn send_udp_motion_ready(
+    writer: &mut transport::FrameWriter<OwnedWriteHalf>,
+    client_session_id: Uuid,
+    client_seq: &mut u64,
+    client_state: &mut ClientRuntimeState,
+) {
+    if client_state.udp_motion_ready_sent {
+        return;
+    }
+    if let Err(err) = writer
+        .write_frame(Frame::new(
+            client_session_id,
+            *client_seq,
+            Message::ClientControl(ClientControlEvent::UdpMotionReady),
+        ))
+        .await
+    {
+        warn!(?err, "failed to acknowledge udp motion");
+        return;
+    }
+
+    *client_seq += 1;
+    client_state.udp_motion_ready_sent = true;
+    info!("acknowledged udp motion transport");
+}
+
 #[derive(Default)]
 struct ClientRuntimeState {
     remote_active: bool,
     active_modifiers: HashSet<Modifier>,
     right_edge_release_armed: bool,
     just_activated: bool,
+    udp_motion_ready_sent: bool,
 }
 
 impl ClientRuntimeState {
@@ -506,6 +572,7 @@ impl ClientRuntimeState {
         self.reset_keys();
         self.right_edge_release_armed = false;
         self.just_activated = active;
+        self.udp_motion_ready_sent = false;
     }
 
     fn reset_keys(&mut self) {
@@ -563,6 +630,7 @@ async fn make_sink(sink: SinkKind) -> Result<Box<dyn HidSink>> {
     match sink {
         SinkKind::Log => Ok(Box::new(LogSink::default())),
         SinkKind::Karabiner => hid::karabiner_sink_async().await,
+        SinkKind::NativeHid => hid::native_hid_sink_async().await,
     }
 }
 

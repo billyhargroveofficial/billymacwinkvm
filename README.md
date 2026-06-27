@@ -20,6 +20,7 @@ The repo currently contains:
 - Karabiner VirtualHID wire-format encoder.
 - Windows Raw Input host MVP with `Ctrl+Alt+\` toggle and `mac-left` edge activation.
 - Split transport: TCP for reliable state/keyboard/buttons/wheel, binary UDP `SKM1` datagrams for mouse motion.
+- Native macOS `IOHIDUserDevice` probe/backend scaffold; current unsigned dev build fails without Apple's `com.apple.developer.hid.virtual.device` entitlement.
 - Setup docs under `docs/`.
 
 Still missing for the final "feels native on a 200 Hz monitor" version:
@@ -39,6 +40,7 @@ cargo build
 cargo test
 ./scripts/test-local.sh
 cargo run -- mac-hid-probe
+cargo run -- mac-native-hid-probe
 cargo run -- client --listen 127.0.0.1:49321 --sink log
 cargo run -- probe --peer 127.0.0.1:49321
 ./scripts/parallels-probe.sh

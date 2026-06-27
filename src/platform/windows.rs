@@ -94,7 +94,10 @@ pub async fn run_host(peer: String, layout: String) -> Result<()> {
 }
 
 enum MotionTransport {
-    Udp(UdpMotionWriter),
+    Udp {
+        writer: UdpMotionWriter,
+        confirmed: bool,
+    },
     Tcp,
 }
 
@@ -111,7 +114,10 @@ impl MotionTransport {
             Ok(socket) => match socket.connect(peer).await {
                 Ok(()) => {
                     info!(%peer, "using udp/binary motion transport");
-                    Self::Udp(UdpMotionWriter { socket, seq: 1 })
+                    Self::Udp {
+                        writer: UdpMotionWriter { socket, seq: 1 },
+                        confirmed: false,
+                    }
                 }
                 Err(err) => {
                     warn!(?err, %peer, "udp motion connect failed; falling back to tcp/json motion");
@@ -130,11 +136,45 @@ impl MotionTransport {
 
     async fn send_motion(&mut self, dx: i32, dy: i32) -> Result<bool> {
         match self {
-            Self::Udp(writer) => {
+            Self::Udp {
+                writer,
+                confirmed: true,
+            } => {
                 writer.send_motion(dx, dy).await?;
                 Ok(true)
             }
+            Self::Udp {
+                writer,
+                confirmed: false,
+            } => {
+                writer.send_motion(0, 0).await?;
+                Ok(false)
+            }
             Self::Tcp => Ok(false),
+        }
+    }
+
+    async fn probe(&mut self) {
+        if let Self::Udp {
+            writer,
+            confirmed: false,
+        } = self
+            && let Err(err) = writer.send_motion(0, 0).await
+        {
+            warn!(
+                ?err,
+                "udp motion probe failed; falling back to tcp/json motion"
+            );
+            *self = Self::Tcp;
+        }
+    }
+
+    fn confirm(&mut self) {
+        if let Self::Udp { confirmed, .. } = self
+            && !*confirmed
+        {
+            *confirmed = true;
+            info!("udp motion transport confirmed by macOS client");
         }
     }
 }
@@ -319,6 +359,59 @@ async fn handle_host_command(
             )
             .await
         }
+        HostCommand::HostState { active, reason } => {
+            if !flush_pending_motion(writer, session_id, seq, pending_dx, pending_dy).await {
+                return false;
+            }
+            let ok = write_host_message(
+                writer,
+                session_id,
+                seq,
+                Message::HostState(HostStateEvent {
+                    remote_active: active,
+                    reason: reason.to_owned(),
+                    entry_x_ratio: None,
+                    entry_y_ratio: None,
+                }),
+                "host writer disconnected",
+            )
+            .await;
+            if ok && active {
+                motion_transport.probe().await;
+            }
+            ok
+        }
+        HostCommand::HostStateWithEntry {
+            active,
+            reason,
+            entry_x_ratio,
+            entry_y_ratio,
+        } => {
+            if !flush_pending_motion(writer, session_id, seq, pending_dx, pending_dy).await {
+                return false;
+            }
+            let ok = write_host_message(
+                writer,
+                session_id,
+                seq,
+                Message::HostState(HostStateEvent {
+                    remote_active: active,
+                    reason: reason.to_owned(),
+                    entry_x_ratio: Some(entry_x_ratio),
+                    entry_y_ratio: Some(entry_y_ratio),
+                }),
+                "host writer disconnected",
+            )
+            .await;
+            if ok && active {
+                motion_transport.probe().await;
+            }
+            ok
+        }
+        HostCommand::UdpMotionReady => {
+            motion_transport.confirm();
+            true
+        }
         other => {
             if !flush_pending_motion(writer, session_id, seq, pending_dx, pending_dy).await {
                 return false;
@@ -427,6 +520,7 @@ fn message_from_host_command(command: HostCommand) -> Message {
         }),
         HostCommand::Input(event) | HostCommand::InputImmediate(event) => Message::Input(event),
         HostCommand::Reset => Message::InputReset,
+        HostCommand::UdpMotionReady => unreachable!("handled before serialization"),
     }
 }
 
@@ -448,27 +542,38 @@ async fn control_reader_task(stream: OwnedReadHalf) {
             }
         };
 
-        if let Message::ClientControl(ClientControlEvent::ReleaseHost {
-            reason,
-            entry_x_ratio,
-            entry_y_ratio,
-        }) = frame.message
-        {
-            info!(%reason, "client requested host release");
-            match lock_state() {
-                Ok(mut state) => {
-                    if state.remote_active
-                        && let Err(err) = state.set_remote_active(
-                            false,
-                            "mac right edge",
-                            entry_x_ratio,
-                            entry_y_ratio,
-                        )
-                    {
-                        warn!(?err, "failed to release host from client control");
+        if let Message::ClientControl(control) = frame.message {
+            match control {
+                ClientControlEvent::ReleaseHost {
+                    reason,
+                    entry_x_ratio,
+                    entry_y_ratio,
+                } => {
+                    info!(%reason, "client requested host release");
+                    match lock_state() {
+                        Ok(mut state) => {
+                            if state.remote_active
+                                && let Err(err) = state.set_remote_active(
+                                    false,
+                                    "mac right edge",
+                                    entry_x_ratio,
+                                    entry_y_ratio,
+                                )
+                            {
+                                warn!(?err, "failed to release host from client control");
+                            }
+                        }
+                        Err(err) => warn!(?err, "failed to lock host state for client control"),
                     }
                 }
-                Err(err) => warn!(?err, "failed to lock host state for client control"),
+                ClientControlEvent::UdpMotionReady => match lock_state() {
+                    Ok(state) => {
+                        if let Err(err) = state.send(HostCommand::UdpMotionReady) {
+                            warn!(?err, "failed to forward udp motion ready control");
+                        }
+                    }
+                    Err(err) => warn!(?err, "failed to lock host state for udp motion ready"),
+                },
             }
         }
     }
@@ -1055,6 +1160,7 @@ enum HostCommand {
     },
     Input(InputEvent),
     InputImmediate(InputEvent),
+    UdpMotionReady,
     Reset,
 }
 

@@ -117,6 +117,305 @@ pub async fn karabiner_sink_async() -> Result<Box<dyn HidSink>> {
     anyhow::bail!("Karabiner VirtualHID sink is macOS-only")
 }
 
+#[cfg(target_os = "macos")]
+pub async fn native_hid_sink_async() -> Result<Box<dyn HidSink>> {
+    Ok(Box::new(NativeHidSink::open()?))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub async fn native_hid_sink_async() -> Result<Box<dyn HidSink>> {
+    anyhow::bail!("native macOS HID sink is macOS-only")
+}
+
+#[cfg(target_os = "macos")]
+struct NativeHidSink {
+    mouse: NativeHidUserDevice,
+    keyboard: NativeHidUserDevice,
+    buttons: u8,
+    modifiers: u8,
+    keys: HashSet<u8>,
+    modifier_policy: MacModifierPolicy,
+}
+
+#[cfg(target_os = "macos")]
+impl NativeHidSink {
+    fn open() -> Result<Self> {
+        let mouse = NativeHidUserDevice::create(
+            "softkvm Native Mouse",
+            0x01,
+            0x02,
+            NATIVE_MOUSE_REPORT_DESCRIPTOR,
+        )?;
+        let keyboard = NativeHidUserDevice::create(
+            "softkvm Native Keyboard",
+            0x01,
+            0x06,
+            NATIVE_KEYBOARD_REPORT_DESCRIPTOR,
+        )?;
+        let modifier_policy = MacModifierPolicy::from_env();
+        info!(?modifier_policy, "using native macOS virtual HID sink");
+        Ok(Self {
+            mouse,
+            keyboard,
+            buttons: 0,
+            modifiers: 0,
+            keys: HashSet::new(),
+            modifier_policy,
+        })
+    }
+
+    fn post_mouse_chunks(
+        &mut self,
+        dx: i32,
+        dy: i32,
+        vertical_wheel: i32,
+        horizontal_wheel: i32,
+    ) -> Result<()> {
+        let mut dx = dx;
+        let mut dy = dy;
+        let mut vertical_wheel = vertical_wheel;
+        let mut horizontal_wheel = horizontal_wheel;
+
+        while dx != 0 || dy != 0 || vertical_wheel != 0 || horizontal_wheel != 0 {
+            let report = [
+                1,
+                self.buttons,
+                take_i8_chunk(&mut dx) as u8,
+                take_i8_chunk(&mut dy) as u8,
+                take_i8_chunk(&mut vertical_wheel) as u8,
+                take_i8_chunk(&mut horizontal_wheel) as u8,
+            ];
+            self.mouse.post_report(&report)?;
+        }
+        Ok(())
+    }
+
+    fn post_mouse_state(&mut self) -> Result<()> {
+        self.mouse.post_report(&[1, self.buttons, 0, 0, 0, 0])
+    }
+
+    fn post_keyboard_state(&mut self) -> Result<()> {
+        let mut report = [0_u8; 9];
+        report[0] = 1;
+        report[1] = self.modifiers;
+        let mut pressed = self.keys.iter().copied().collect::<Vec<_>>();
+        pressed.sort_unstable();
+        for (slot, key) in report[3..].iter_mut().zip(pressed.iter().copied()) {
+            *slot = key;
+        }
+        self.keyboard.post_report(&report)
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[async_trait::async_trait]
+impl HidSink for NativeHidSink {
+    async fn apply(&mut self, event: InputEvent) -> Result<()> {
+        match event {
+            InputEvent::MouseMotion { dx, dy } => self.post_mouse_chunks(dx, dy, 0, 0),
+            InputEvent::MouseWheel { dx, dy } => self.post_mouse_chunks(0, 0, dy, dx),
+            InputEvent::MouseButton { button, state } => {
+                let bit = mouse_button_bit_u8(button);
+                match state {
+                    KeyState::Down => self.buttons |= bit,
+                    KeyState::Up => self.buttons &= !bit,
+                }
+                self.post_mouse_state()
+            }
+            InputEvent::Modifier { modifier, state } => {
+                let bit = mac_modifier_bit(self.modifier_policy.map(modifier));
+                match state {
+                    KeyState::Down => self.modifiers |= bit,
+                    KeyState::Up => self.modifiers &= !bit,
+                }
+                self.post_keyboard_state()
+            }
+            InputEvent::Key { key, state } => {
+                let Some(usage) = mac_key_usage_u8(key) else {
+                    return Ok(());
+                };
+                match state {
+                    KeyState::Down => {
+                        self.keys.insert(usage);
+                    }
+                    KeyState::Up => {
+                        self.keys.remove(&usage);
+                    }
+                }
+                self.post_keyboard_state()
+            }
+        }
+    }
+
+    async fn reset(&mut self) -> Result<()> {
+        self.buttons = 0;
+        self.modifiers = 0;
+        self.keys.clear();
+        self.post_mouse_state()?;
+        self.post_keyboard_state()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mouse_button_bit_u8(button: MouseButton) -> u8 {
+    mouse_button_bit(button) as u8
+}
+
+#[cfg(target_os = "macos")]
+fn mac_key_usage_u8(key: KeyCode) -> Option<u8> {
+    let usage = mac_key_usage(key)?;
+    u8::try_from(usage).ok()
+}
+
+#[cfg(target_os = "macos")]
+struct NativeHidUserDevice {
+    device: IOHIDUserDeviceRef,
+}
+
+#[cfg(target_os = "macos")]
+unsafe impl Send for NativeHidUserDevice {}
+
+#[cfg(target_os = "macos")]
+impl NativeHidUserDevice {
+    fn create(
+        product: &'static str,
+        primary_usage_page: i32,
+        primary_usage: i32,
+        report_descriptor: &[u8],
+    ) -> Result<Self> {
+        use core_foundation::base::{TCFType, kCFAllocatorDefault};
+        use core_foundation::data::CFData;
+        use core_foundation::dictionary::CFDictionary;
+        use core_foundation::number::CFNumber;
+        use core_foundation::string::CFString;
+
+        let keys = [
+            CFString::from_static_string("ReportDescriptor"),
+            CFString::from_static_string("VendorID"),
+            CFString::from_static_string("ProductID"),
+            CFString::from_static_string("Product"),
+            CFString::from_static_string("Transport"),
+            CFString::from_static_string("PrimaryUsagePage"),
+            CFString::from_static_string("PrimaryUsage"),
+        ];
+        let descriptor = CFData::from_buffer(report_descriptor);
+        let vendor_id = CFNumber::from(0x16c0_i32);
+        let product_id = CFNumber::from(if primary_usage == 0x02 {
+            0x27db_i32
+        } else {
+            0x27dc_i32
+        });
+        let product = CFString::from_static_string(product);
+        let transport = CFString::from_static_string("Virtual");
+        let usage_page = CFNumber::from(primary_usage_page);
+        let usage = CFNumber::from(primary_usage);
+        let values = [
+            descriptor.as_CFType(),
+            vendor_id.as_CFType(),
+            product_id.as_CFType(),
+            product.as_CFType(),
+            transport.as_CFType(),
+            usage_page.as_CFType(),
+            usage.as_CFType(),
+        ];
+        let pairs = keys
+            .into_iter()
+            .zip(values)
+            .collect::<Vec<(CFString, core_foundation::base::CFType)>>();
+        let properties = CFDictionary::from_CFType_pairs(&pairs);
+        let device = unsafe {
+            IOHIDUserDeviceCreateWithProperties(
+                kCFAllocatorDefault,
+                properties.as_concrete_TypeRef(),
+                0,
+            )
+        };
+        if device.is_null() {
+            bail!(
+                "IOHIDUserDeviceCreateWithProperties returned null for {product}; likely missing com.apple.developer.hid.virtual.device entitlement"
+            );
+        }
+        Ok(Self { device })
+    }
+
+    fn post_report(&self, report: &[u8]) -> Result<()> {
+        let started = Instant::now();
+        let status = unsafe {
+            IOHIDUserDeviceHandleReportWithTimeStamp(
+                self.device,
+                mach_absolute_time(),
+                report.as_ptr(),
+                report.len() as _,
+            )
+        };
+        if status != 0 {
+            bail!("IOHIDUserDeviceHandleReportWithTimeStamp failed: 0x{status:08x}");
+        }
+        let elapsed = started.elapsed();
+        if latency::report(elapsed) {
+            info!(
+                target: "softkvm::latency",
+                bytes = report.len(),
+                elapsed_ms = latency::ms(elapsed),
+                "native macOS HID report latency"
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for NativeHidUserDevice {
+    fn drop(&mut self) {
+        unsafe {
+            IOHIDUserDeviceCancel(self.device);
+            core_foundation::base::CFRelease(self.device.cast_const());
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+type IOHIDUserDeviceRef = *mut std::ffi::c_void;
+
+#[cfg(target_os = "macos")]
+#[link(name = "IOKit", kind = "framework")]
+unsafe extern "C" {
+    fn IOHIDUserDeviceCreateWithProperties(
+        allocator: core_foundation::base::CFAllocatorRef,
+        properties: core_foundation::dictionary::CFDictionaryRef,
+        options: u32,
+    ) -> IOHIDUserDeviceRef;
+    fn IOHIDUserDeviceHandleReportWithTimeStamp(
+        device: IOHIDUserDeviceRef,
+        timestamp: u64,
+        report: *const u8,
+        report_length: core_foundation::base::CFIndex,
+    ) -> i32;
+    fn IOHIDUserDeviceCancel(device: IOHIDUserDeviceRef);
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn mach_absolute_time() -> u64;
+}
+
+#[cfg(target_os = "macos")]
+const NATIVE_MOUSE_REPORT_DESCRIPTOR: &[u8] = &[
+    0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x85, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x05, 0x09, 0x19, 0x01,
+    0x29, 0x05, 0x15, 0x00, 0x25, 0x01, 0x95, 0x05, 0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x03,
+    0x81, 0x03, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7f, 0x75, 0x08,
+    0x95, 0x03, 0x81, 0x06, 0x05, 0x0c, 0x0a, 0x38, 0x02, 0x15, 0x81, 0x25, 0x7f, 0x75, 0x08, 0x95,
+    0x01, 0x81, 0x06, 0xc0, 0xc0,
+];
+
+#[cfg(target_os = "macos")]
+const NATIVE_KEYBOARD_REPORT_DESCRIPTOR: &[u8] = &[
+    0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x85, 0x01, 0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7, 0x15, 0x00,
+    0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01, 0x75, 0x08, 0x81, 0x03, 0x95, 0x06,
+    0x75, 0x08, 0x15, 0x00, 0x26, 0xff, 0x00, 0x05, 0x07, 0x19, 0x00, 0x2a, 0xff, 0x00, 0x81, 0x00,
+    0xc0,
+];
+
 #[cfg(unix)]
 struct KarabinerSink {
     client: KarabinerClient,
