@@ -12,6 +12,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 #[cfg(unix)]
 use tokio::sync::Mutex as AsyncMutex;
+#[cfg(unix)]
+use tokio::time::{Duration, sleep};
 use tracing::info;
 #[cfg(unix)]
 use tracing::warn;
@@ -271,6 +273,7 @@ impl KarabinerClient {
         let (reader, writer) = stream.into_split();
         let writer = Arc::new(AsyncMutex::new(writer));
         tokio::spawn(karabiner_reader_task(reader, writer.clone()));
+        tokio::spawn(karabiner_heartbeat_task(writer.clone()));
         Ok(Self {
             writer,
             next_request_id: 1,
@@ -339,6 +342,18 @@ impl KarabinerClient {
 
         let mut writer = self.writer.lock().await;
         write_karabiner_body(&mut *writer, &body).await
+    }
+}
+
+#[cfg(unix)]
+async fn karabiner_heartbeat_task(writer: Arc<AsyncMutex<OwnedWriteHalf>>) {
+    loop {
+        sleep(Duration::from_millis(2500)).await;
+        let mut writer = writer.lock().await;
+        if let Err(err) = write_control_frame(&mut *writer, 0, &[]).await {
+            warn!(?err, "Karabiner heartbeat stopped");
+            break;
+        }
     }
 }
 
