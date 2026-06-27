@@ -67,10 +67,7 @@ async fn mac_hid_smoke() -> Result<()> {
 }
 
 async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
-    let mut sink: Box<dyn HidSink> = match sink {
-        SinkKind::Log => Box::new(LogSink::default()),
-        SinkKind::Karabiner => hid::karabiner_sink_async().await?,
-    };
+    let mut hid_sink = make_sink(sink).await?;
 
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
@@ -82,7 +79,11 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
         info!(%addr, "accepted host");
 
         let mut reader = transport::FrameReader::new(stream);
+        let mut saw_frame = false;
+        let mut touched_input = false;
+
         while let Some(frame) = reader.read_frame().await? {
+            saw_frame = true;
             match frame.message {
                 Message::Hello(hello) => {
                     info!(?hello, "host hello");
@@ -91,10 +92,12 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
                     info!(?state, "host state");
                 }
                 Message::Input(event) => {
-                    sink.apply(event).await?;
+                    touched_input = true;
+                    apply_input(&mut hid_sink, sink, event).await;
                 }
                 Message::InputReset => {
-                    sink.reset().await?;
+                    touched_input = true;
+                    reset_input(&mut hid_sink, sink).await;
                 }
                 Message::Heartbeat { monotonic_ms } => {
                     info!(monotonic_ms, "heartbeat");
@@ -102,8 +105,56 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
             }
         }
 
-        warn!(%addr, "host disconnected");
-        sink.reset().await?;
+        if saw_frame {
+            warn!(%addr, "host disconnected");
+        } else {
+            info!(%addr, "empty tcp probe disconnected");
+        }
+
+        if touched_input {
+            reset_input(&mut hid_sink, sink).await;
+        }
+    }
+}
+
+async fn make_sink(sink: SinkKind) -> Result<Box<dyn HidSink>> {
+    match sink {
+        SinkKind::Log => Ok(Box::new(LogSink::default())),
+        SinkKind::Karabiner => hid::karabiner_sink_async().await,
+    }
+}
+
+async fn apply_input(hid_sink: &mut Box<dyn HidSink>, sink: SinkKind, event: InputEvent) {
+    if let Err(err) = hid_sink.apply(event.clone()).await {
+        warn!(?err, "input sink failed; reconnecting");
+        match make_sink(sink).await {
+            Ok(mut replacement) => {
+                if let Err(retry_err) = replacement.apply(event).await {
+                    warn!(?retry_err, "input sink retry failed");
+                }
+                *hid_sink = replacement;
+            }
+            Err(reconnect_err) => {
+                warn!(?reconnect_err, "input sink reconnect failed");
+            }
+        }
+    }
+}
+
+async fn reset_input(hid_sink: &mut Box<dyn HidSink>, sink: SinkKind) {
+    if let Err(err) = hid_sink.reset().await {
+        warn!(?err, "input sink reset failed; reconnecting");
+        match make_sink(sink).await {
+            Ok(mut replacement) => {
+                if let Err(retry_err) = replacement.reset().await {
+                    warn!(?retry_err, "input sink reset retry failed");
+                }
+                *hid_sink = replacement;
+            }
+            Err(reconnect_err) => {
+                warn!(?reconnect_err, "input sink reconnect failed");
+            }
+        }
     }
 }
 
