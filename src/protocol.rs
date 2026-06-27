@@ -133,7 +133,7 @@ impl MacModifierPolicy {
                 Self::SwapAltSuper
             }
             Ok(value) if matches!(value.as_str(), "native" | "mac" | "semantic") => Self::Native,
-            _ => Self::Native,
+            _ => Self::SwapAltSuper,
         }
     }
 

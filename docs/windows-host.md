@@ -68,8 +68,8 @@ The persistent low-level keyboard hook detects `Ctrl+(Alt|Win)+\` in both host-a
 
 When controlling macOS:
 
-- Default semantic profile: Windows `Super/Win` -> macOS `Command`, Windows `Alt` -> macOS `Option`
-- Optional PC physical-order profile via `SOFTKVM_MAC_MODIFIER_POLICY=swap-alt-super`: Windows `Alt` -> macOS `Command`, Windows `Super/Win` -> macOS `Option`
+- Default PC physical-order profile: Windows `Alt` -> macOS `Command`, Windows `Super/Win` -> macOS `Option`
+- Optional semantic profile via `SOFTKVM_MAC_MODIFIER_POLICY=native`: Windows `Super/Win` -> macOS `Command`, Windows `Alt` -> macOS `Option`
 - Windows `Ctrl` -> macOS `Control`
 - Windows `Shift` -> macOS `Shift`
 

@@ -29,4 +29,7 @@ fi
 echo
 echo "Starting real macOS input receiver through Karabiner VirtualHID."
 echo "Leave this terminal open. Stop with Ctrl+C."
-sudo env RUST_LOG="${RUST_LOG:-softkvm=info}" "$ROOT/target/debug/softkvm" client --listen "0.0.0.0:$PORT" --sink karabiner
+sudo env \
+  RUST_LOG="${RUST_LOG:-softkvm=info}" \
+  SOFTKVM_MAC_MODIFIER_POLICY="${SOFTKVM_MAC_MODIFIER_POLICY:-swap-alt-super}" \
+  "$ROOT/target/debug/softkvm" client --listen "0.0.0.0:$PORT" --sink karabiner
