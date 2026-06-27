@@ -1,8 +1,12 @@
-use anyhow::{Context, Result};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::Result;
 use serde::Serialize;
 use tracing::info;
 
-use crate::protocol::{InputEvent, KeyState, MacModifier, MacModifierPolicy, MouseButton};
+use crate::protocol::InputEvent;
+#[cfg(unix)]
+use crate::protocol::{KeyState, MacModifier, MacModifierPolicy, MouseButton};
 
 #[async_trait::async_trait]
 pub trait HidSink: Send {
@@ -81,10 +85,17 @@ fn candidate_paths() -> Vec<&'static str> {
 pub const KARABINER_SOCKET: &str =
     "/Library/Application Support/org.pqrs/tmp/rootonly/karabiner_virtual_hid_device_service.sock";
 
+#[cfg(unix)]
 pub async fn karabiner_sink_async() -> Result<Box<dyn HidSink>> {
     Ok(Box::new(KarabinerSink::connect().await?))
 }
 
+#[cfg(not(unix))]
+pub async fn karabiner_sink_async() -> Result<Box<dyn HidSink>> {
+    anyhow::bail!("Karabiner VirtualHID sink is macOS-only")
+}
+
+#[cfg(unix)]
 struct KarabinerSink {
     client: KarabinerClient,
     buttons: u32,
@@ -92,6 +103,7 @@ struct KarabinerSink {
     modifier_policy: MacModifierPolicy,
 }
 
+#[cfg(unix)]
 impl KarabinerSink {
     async fn connect() -> Result<Self> {
         let mut client = KarabinerClient::connect(KARABINER_SOCKET).await?;
@@ -135,6 +147,7 @@ impl KarabinerSink {
     }
 }
 
+#[cfg(unix)]
 #[async_trait::async_trait]
 impl HidSink for KarabinerSink {
     async fn apply(&mut self, event: InputEvent) -> Result<()> {
@@ -173,6 +186,7 @@ impl HidSink for KarabinerSink {
     }
 }
 
+#[cfg(unix)]
 fn mouse_button_bit(button: MouseButton) -> u32 {
     let one_based = match button {
         MouseButton::Left => 1,
@@ -184,6 +198,7 @@ fn mouse_button_bit(button: MouseButton) -> u32 {
     1 << (one_based - 1)
 }
 
+#[cfg(unix)]
 fn mac_modifier_bit(modifier: MacModifier) -> u8 {
     match modifier {
         MacModifier::Control => 0x01,
@@ -193,17 +208,20 @@ fn mac_modifier_bit(modifier: MacModifier) -> u8 {
     }
 }
 
+#[cfg(unix)]
 fn take_i8_chunk(value: &mut i32) -> i8 {
     let chunk = (*value).clamp(i8::MIN as i32, i8::MAX as i32);
     *value -= chunk;
     chunk as i8
 }
 
+#[cfg(unix)]
 struct KarabinerClient {
     stream: tokio::net::UnixStream,
     next_request_id: u64,
 }
 
+#[cfg(unix)]
 impl KarabinerClient {
     async fn connect(path: &str) -> Result<Self> {
         let stream = tokio::net::UnixStream::connect(path)
@@ -284,6 +302,7 @@ impl KarabinerClient {
     }
 }
 
+#[cfg(unix)]
 #[derive(Clone, Copy)]
 enum KarabinerRequest {
     VirtualHidKeyboardInitialize = 1,
