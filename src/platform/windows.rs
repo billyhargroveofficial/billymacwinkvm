@@ -32,7 +32,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL, RegisterClassW, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     SetCursorPos, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
     WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY, WM_HOTKEY, WM_INPUT, WM_KEYDOWN,
-    WM_SYSKEYDOWN, WNDCLASSW,
+    WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
 };
 use windows::core::w;
 
@@ -45,6 +45,8 @@ use crate::transport::FrameWriter;
 const HOTKEY_ID_TOGGLE_BACKSLASH: i32 = 1;
 const HOTKEY_ID_TOGGLE_NON_US_BACKSLASH: i32 = 2;
 const EDGE_TRIGGER_PX: i32 = 8;
+const MAX_MOUSE_COALESCE_EVENTS: usize = 4;
+const MAX_MOUSE_COALESCE_DELTA: i32 = 96;
 const WHEEL_DELTA: i32 = 120;
 const SCANCODE_BACKSLASH: u32 = 0x2b;
 const SCANCODE_NON_US_BACKSLASH: u32 = 0x56;
@@ -143,14 +145,29 @@ fn coalesce_host_command(
         return command;
     };
 
+    let mut merged_events = 1_usize;
     loop {
+        if merged_events >= MAX_MOUSE_COALESCE_EVENTS {
+            break;
+        }
+
         match rx.try_recv() {
             Ok(HostCommand::Input(InputEvent::MouseMotion {
                 dx: next_dx,
                 dy: next_dy,
             })) => {
+                if (dx + next_dx).abs() > MAX_MOUSE_COALESCE_DELTA
+                    || (dy + next_dy).abs() > MAX_MOUSE_COALESCE_DELTA
+                {
+                    pending.push_back(HostCommand::Input(InputEvent::MouseMotion {
+                        dx: next_dx,
+                        dy: next_dy,
+                    }));
+                    break;
+                }
                 dx += next_dx;
                 dy += next_dy;
+                merged_events += 1;
             }
             Ok(other) => {
                 pending.push_back(other);
@@ -479,33 +496,13 @@ fn handle_keyboard(raw: RAWINPUT) -> Result<()> {
         KeyState::Down
     };
     let vkey = keyboard.VKey;
-    let make_code = u32::from(keyboard.MakeCode);
 
     let mut state = lock_state()?;
-    let events = state.keyboard_events(vkey, key_state);
-    if state.remote_active
-        && key_state == KeyState::Down
-        && is_backslash_key(vkey, make_code)
-        && state.control_alt_active()
-    {
-        state.set_remote_active(false, "hotkey Ctrl+Alt+\\")?;
+    if state.remote_active {
         return Ok(());
     }
 
-    if state.remote_active {
-        if !events.is_empty() {
-            info!(
-                vkey,
-                make_code,
-                ?key_state,
-                ?events,
-                "sending remote keyboard input"
-            );
-        }
-        for event in events {
-            state.send(HostCommand::Input(event))?;
-        }
-    }
+    state.keyboard_events(vkey, key_state);
     Ok(())
 }
 
@@ -554,19 +551,39 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
 unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 {
         let message = wparam.0 as u32;
-        if message == WM_KEYDOWN || message == WM_SYSKEYDOWN {
+        let key_down_message = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+        let key_up_message = message == WM_KEYUP || message == WM_SYSKEYUP;
+
+        if key_down_message || key_up_message {
             let key = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-            let ctrl_alt = ctrl_alt_down();
-            if remote_is_active() && ctrl_alt {
-                info!(
-                    vkey = key.vkCode,
-                    scan_code = key.scanCode,
-                    "remote Ctrl+Alt keydown"
-                );
+
+            if key_down_message {
+                let ctrl_alt = ctrl_alt_down();
+                if remote_is_active() && ctrl_alt {
+                    info!(
+                        vkey = key.vkCode,
+                        scan_code = key.scanCode,
+                        "remote Ctrl+Alt keydown"
+                    );
+                }
+                if is_backslash_key(key.vkCode as u16, key.scanCode) && ctrl_alt {
+                    if let Err(err) = toggle_remote("hotkey Ctrl+Alt+\\") {
+                        error!(?err, "toggle failed");
+                    }
+                    return LRESULT(1);
+                }
             }
-            if is_backslash_key(key.vkCode as u16, key.scanCode) && ctrl_alt {
-                if let Err(err) = toggle_remote("hotkey Ctrl+Alt+\\") {
-                    error!(?err, "toggle failed");
+
+            if remote_is_active() {
+                let key_state = if key_up_message {
+                    KeyState::Up
+                } else {
+                    KeyState::Down
+                };
+                if let Err(err) =
+                    send_remote_keyboard_from_hook(key.vkCode as u16, key.scanCode, key_state)
+                {
+                    warn!(?err, "failed to send remote keyboard hook input");
                 }
                 return LRESULT(1);
             }
@@ -578,6 +595,28 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
     }
 
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+fn send_remote_keyboard_from_hook(vkey: u16, scan_code: u32, key_state: KeyState) -> Result<()> {
+    let mut state = lock_state()?;
+    if !state.remote_active {
+        return Ok(());
+    }
+
+    let events = state.keyboard_events(vkey, key_state);
+    if !events.is_empty() {
+        info!(
+            vkey,
+            scan_code,
+            ?key_state,
+            ?events,
+            "sending remote keyboard hook input"
+        );
+    }
+    for event in events {
+        state.send(HostCommand::Input(event))?;
+    }
+    Ok(())
 }
 
 fn remote_is_active() -> bool {
@@ -712,11 +751,6 @@ impl HostState {
                 state: key_state,
             }]
         }
-    }
-
-    fn control_alt_active(&self) -> bool {
-        self.active_modifiers.contains(&Modifier::Control)
-            && self.active_modifiers.contains(&Modifier::Alt)
     }
 
     fn capture_local_controls(&mut self) -> Result<()> {

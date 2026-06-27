@@ -34,9 +34,11 @@ Implemented in `src/platform/windows.rs`:
 - `GetRawInputData` parsing for relative mouse motion, buttons, wheel, keyboard keys, and modifiers.
 - `Ctrl+Alt+\` via `RegisterHotKey`.
 - `mac-left` edge activation when the cursor is at the Windows virtual-screen left edge and the mouse moves further left.
-- Cursor clipping to the left edge while remote macOS control is active.
+- Cursor parking/clipping while remote macOS control is active.
+- Low-level mouse/keyboard hooks suppress local Windows input while remote macOS control is active.
+- Remote keyboard forwarding from `WH_KEYBOARD_LL`, so the same hook that suppresses Windows input sends key down/up events to macOS.
 
-This is enough to start real Windows-host capture, but it is not the final high-polish capture path yet because local suppression hooks are not wired.
+This is enough to run real Windows-host capture. The next polish area is high-polling mouse smoothness under real LAN load.
 
 ## Target State Machine
 

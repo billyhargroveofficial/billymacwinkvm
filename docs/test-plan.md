@@ -79,8 +79,8 @@ Expected Mac log:
 Manual input check:
 
 - Press `Ctrl+Alt+\` to toggle remote mode.
-- If `Ctrl+Alt+\` does not fire on the current keyboard layout, press `Ctrl+Alt+F12`.
 - Or push the pointer into the Windows left edge with `--layout mac-left`.
 - Move the mouse and press harmless keys while watching the Mac log receiver.
+- On the Windows host log, keyboard forwarding should print `sending remote keyboard hook input`.
 
-Current limitation: local suppression hooks are not implemented yet, so Windows apps may still receive input while remote mode is active. Use a harmless empty desktop/window for this first real-machine test.
+If keyboard events do not arrive on macOS, first check whether the Windows log shows `sending remote keyboard hook input`. If it does, debug the Mac receiver path; if it does not, debug the Windows hook path.
