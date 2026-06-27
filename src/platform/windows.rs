@@ -42,6 +42,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::w;
 
+use crate::latency;
 use crate::protocol::{
     ClientControlEvent, Frame, HostStateEvent, InputEvent, KeyCode, KeyState, Message, Modifier,
     MouseButton, ProtocolHello,
@@ -244,10 +245,24 @@ async fn flush_pending_motion(
         return true;
     }
 
+    let raw_dx = *pending_dx;
+    let raw_dy = *pending_dy;
     let dx =
         std::mem::take(pending_dx).clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH);
     let dy =
         std::mem::take(pending_dy).clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH);
+    if latency::enabled() || dx != raw_dx || dy != raw_dy {
+        info!(
+            target: "softkvm::latency",
+            raw_dx,
+            raw_dy,
+            sent_dx = dx,
+            sent_dy = dy,
+            dropped_dx = raw_dx - dx,
+            dropped_dy = raw_dy - dy,
+            "windows motion flush batch"
+        );
+    }
     write_host_message(
         writer,
         session_id,
@@ -265,13 +280,26 @@ async fn write_host_message(
     message: Message,
     disconnect_reason: &'static str,
 ) -> bool {
+    let message_label = message.label();
+    let current_seq = *seq;
+    let started = Instant::now();
     if let Err(err) = writer
-        .write_frame(Frame::new(session_id, *seq, message))
+        .write_frame(Frame::new(session_id, current_seq, message))
         .await
     {
         error!(?err, "host writer disconnected");
         release_host_state_after_transport_loss(disconnect_reason);
         return false;
+    }
+    let elapsed = started.elapsed();
+    if latency::report(elapsed) {
+        info!(
+            target: "softkvm::latency",
+            seq = current_seq,
+            message = message_label,
+            elapsed_ms = latency::ms(elapsed),
+            "windows tcp write latency"
+        );
     }
     *seq += 1;
     true
@@ -548,6 +576,7 @@ unsafe fn read_raw_input(lparam: LPARAM) -> Result<RAWINPUT> {
 }
 
 fn handle_mouse(raw: RAWINPUT) -> Result<()> {
+    let started = Instant::now();
     let mouse = unsafe { raw.data.mouse };
     let mut events = Vec::new();
 
@@ -596,8 +625,18 @@ fn handle_mouse(raw: RAWINPUT) -> Result<()> {
             Some(y_ratio),
         )?;
         activated_this_packet = true;
+        let elapsed = started.elapsed();
+        info!(
+            target: "softkvm::latency",
+            dx = mouse.lLastX,
+            dy = mouse.lLastY,
+            y_ratio,
+            elapsed_ms = latency::ms(elapsed),
+            "windows left-edge activation packet"
+        );
     }
 
+    let event_count = events.len();
     if state.remote_active {
         for event in events {
             if activated_this_packet && let InputEvent::MouseMotion { dx, dy } = event {
@@ -608,6 +647,16 @@ fn handle_mouse(raw: RAWINPUT) -> Result<()> {
         }
     }
 
+    let elapsed = started.elapsed();
+    if latency::report(elapsed) {
+        info!(
+            target: "softkvm::latency",
+            remote_active = state.remote_active,
+            event_count,
+            elapsed_ms = latency::ms(elapsed),
+            "windows mouse raw input handling"
+        );
+    }
     Ok(())
 }
 
@@ -960,11 +1009,13 @@ impl HostState {
         if self.remote_active == active {
             return Ok(());
         }
+        let total_started = Instant::now();
 
         self.pressed_modifier_keys.clear();
         self.active_modifiers.clear();
 
         if active {
+            let capture_started = Instant::now();
             if let Err(err) = self.capture_local_controls() {
                 self.remote_active = false;
                 REMOTE_ACTIVE_FAST.store(false, Ordering::Relaxed);
@@ -972,9 +1023,11 @@ impl HostState {
                 self.left_edge_armed = false;
                 return Err(err);
             }
+            let capture_elapsed = capture_started.elapsed();
             self.remote_active = true;
             REMOTE_ACTIVE_FAST.store(true, Ordering::Relaxed);
             self.left_edge_armed = false;
+            let send_state_started = Instant::now();
             let send_result = match entry_x_ratio.zip(entry_y_ratio) {
                 Some((entry_x_ratio, entry_y_ratio)) => {
                     self.send(HostCommand::HostStateWithEntry {
@@ -992,12 +1045,25 @@ impl HostState {
                 self.release_local_controls(true, None, None);
                 return Err(err);
             }
+            let send_state_elapsed = send_state_started.elapsed();
+            let modifiers_started = Instant::now();
             if let Err(err) = self.send_current_modifier_state() {
                 self.remote_active = false;
                 REMOTE_ACTIVE_FAST.store(false, Ordering::Relaxed);
                 self.release_local_controls(true, None, None);
                 return Err(err);
             }
+            let modifiers_elapsed = modifiers_started.elapsed();
+            let total_elapsed = total_started.elapsed();
+            info!(
+                target: "softkvm::latency",
+                reason,
+                capture_ms = latency::ms(capture_elapsed),
+                send_state_ms = latency::ms(send_state_elapsed),
+                seed_modifiers_ms = latency::ms(modifiers_elapsed),
+                total_ms = latency::ms(total_elapsed),
+                "windows remote activation latency"
+            );
             info!(reason, "remote macOS control enabled");
         } else {
             self.remote_active = false;
@@ -1094,17 +1160,31 @@ impl HostState {
     }
 
     fn capture_local_controls(&mut self) -> Result<()> {
+        let started = Instant::now();
         let cursor = current_cursor_position().unwrap_or_else(|_| POINT {
             x: unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) },
             y: unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) },
         });
         self.saved_cursor_pos = Some(cursor);
         self.saved_monitor_rect = monitor_rect_for_point(cursor);
+        let clip_started = Instant::now();
         unsafe {
             if let Err(err) = clip_cursor_to_parking_box(cursor) {
                 release_remote_controls();
                 return Err(err);
             }
+        }
+        let clip_elapsed = clip_started.elapsed();
+        let elapsed = started.elapsed();
+        if latency::report(elapsed) {
+            info!(
+                target: "softkvm::latency",
+                x = cursor.x,
+                y = cursor.y,
+                clip_ms = latency::ms(clip_elapsed),
+                total_ms = latency::ms(elapsed),
+                "windows capture local controls latency"
+            );
         }
         Ok(())
     }

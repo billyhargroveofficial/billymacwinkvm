@@ -1,5 +1,6 @@
 mod cli;
 mod hid;
+mod latency;
 mod platform;
 mod protocol;
 mod transport;
@@ -163,14 +164,30 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
                 break;
             };
 
-            let frame = match event {
-                ClientReadEvent::Frame(frame) => frame,
+            let (frame, read_at) = match event {
+                ClientReadEvent::Frame { frame, read_at } => (frame, read_at),
                 ClientReadEvent::Disconnected => break,
                 ClientReadEvent::Failed(err) => {
                     read_error = Some(err);
                     break;
                 }
             };
+            let queue_elapsed = read_at.elapsed();
+            if latency::report(queue_elapsed) {
+                let level = if latency::slow(queue_elapsed) {
+                    "slow"
+                } else {
+                    "trace"
+                };
+                info!(
+                    target: "softkvm::latency",
+                    level,
+                    message = frame.message.label(),
+                    seq = frame.seq,
+                    queue_ms = latency::ms(queue_elapsed),
+                    "mac frame queue latency"
+                );
+            }
 
             saw_frame = true;
             match frame.message {
@@ -203,8 +220,21 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
                             &mut frame_rx,
                             &mut pending_motion,
                             &mut deferred_read_event,
-                        );
+                        )
+                        .inspect(|drained| {
+                            if latency::enabled() || *drained >= MAX_CLIENT_MOTION_DRAIN_PER_TURN {
+                                info!(
+                                    target: "softkvm::latency",
+                                    drained,
+                                    pending_dx = pending_motion.dx,
+                                    pending_dy = pending_motion.dy,
+                                    frame_queue_len = frame_rx.len(),
+                                    "mac drained queued motion"
+                                );
+                            }
+                        });
                         if client_state.take_just_activated() {
+                            let started = Instant::now();
                             let _ = flush_client_motion(
                                 &mut hid_sink,
                                 sink,
@@ -215,6 +245,14 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
                                 &mut pending_motion,
                             )
                             .await;
+                            let elapsed = started.elapsed();
+                            if latency::report(elapsed) {
+                                info!(
+                                    target: "softkvm::latency",
+                                    elapsed_ms = latency::ms(elapsed),
+                                    "mac first motion flush after activation"
+                                );
+                            }
                             flush_timer.reset();
                         }
                         continue;
@@ -291,7 +329,7 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
 }
 
 enum ClientReadEvent {
-    Frame(Frame),
+    Frame { frame: Frame, read_at: Instant },
     Disconnected,
     Failed(anyhow::Error),
 }
@@ -301,7 +339,13 @@ async fn client_reader_task(read_half: OwnedReadHalf, tx: mpsc::UnboundedSender<
     loop {
         match reader.read_frame().await {
             Ok(Some(frame)) => {
-                if tx.send(ClientReadEvent::Frame(frame)).is_err() {
+                if tx
+                    .send(ClientReadEvent::Frame {
+                        frame,
+                        read_at: Instant::now(),
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -321,22 +365,31 @@ fn drain_queued_motion(
     frame_rx: &mut mpsc::UnboundedReceiver<ClientReadEvent>,
     pending_motion: &mut PendingMotion,
     deferred_read_event: &mut Option<ClientReadEvent>,
-) {
+) -> Option<usize> {
+    let mut drained = 0_usize;
     for _ in 0..MAX_CLIENT_MOTION_DRAIN_PER_TURN {
         let Ok(event) = frame_rx.try_recv() else {
             break;
         };
         match event {
-            ClientReadEvent::Frame(Frame {
-                message: Message::Input(InputEvent::MouseMotion { dx, dy }),
+            ClientReadEvent::Frame {
+                frame:
+                    Frame {
+                        message: Message::Input(InputEvent::MouseMotion { dx, dy }),
+                        ..
+                    },
                 ..
-            }) => pending_motion.add(dx, dy),
+            } => {
+                pending_motion.add(dx, dy);
+                drained += 1;
+            }
             other => {
                 *deferred_read_event = Some(other);
                 break;
             }
         }
     }
+    (drained > 0).then_some(drained)
 }
 
 #[derive(Default)]
@@ -585,7 +638,18 @@ fn position_mac_cursor(x_ratio: Option<f64>, y_ratio: Option<f64>) {
         bounds.origin.y + MAC_EDGE_ENTRY_GAP_PX,
         bounds.origin.y + bounds.size.height - MAC_EDGE_ENTRY_GAP_PX,
     );
+    let started = Instant::now();
     unsafe { CGWarpMouseCursorPosition(CGPoint { x, y }) };
+    let elapsed = started.elapsed();
+    if latency::report(elapsed) {
+        info!(
+            target: "softkvm::latency",
+            x,
+            y,
+            elapsed_ms = latency::ms(elapsed),
+            "mac cursor warp"
+        );
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -650,6 +714,7 @@ unsafe fn mac_cursor_and_main_display_bounds() -> Option<(CGPoint, CGRect)> {
 
 async fn apply_input(hid_sink: &mut Box<dyn HidSink>, sink: SinkKind, event: InputEvent) {
     let started = Instant::now();
+    let event_label = event.label();
     if let Err(err) = hid_sink.apply(event.clone()).await {
         warn!(?err, "input sink failed; reconnecting");
         match make_sink(sink).await {
@@ -665,11 +730,12 @@ async fn apply_input(hid_sink: &mut Box<dyn HidSink>, sink: SinkKind, event: Inp
         }
     } else {
         let elapsed = started.elapsed();
-        if elapsed >= Duration::from_millis(20) {
-            warn!(
+        if latency::report(elapsed) {
+            info!(
+                target: "softkvm::latency",
                 elapsed_ms = elapsed.as_millis(),
-                ?event,
-                "input sink apply was slow"
+                event = event_label,
+                "mac input sink apply latency"
             );
         }
     }

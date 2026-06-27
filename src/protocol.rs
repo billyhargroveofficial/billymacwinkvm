@@ -30,6 +30,19 @@ pub enum Message {
     InputReset,
 }
 
+impl Message {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Hello(_) => "hello",
+            Self::Heartbeat { .. } => "heartbeat",
+            Self::HostState(_) => "host_state",
+            Self::ClientControl(_) => "client_control",
+            Self::Input(event) => event.label(),
+            Self::InputReset => "input_reset",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProtocolHello {
     pub protocol_version: u16,
@@ -80,6 +93,18 @@ pub enum InputEvent {
         modifier: Modifier,
         state: KeyState,
     },
+}
+
+impl InputEvent {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::MouseMotion { .. } => "mouse_motion",
+            Self::MouseWheel { .. } => "mouse_wheel",
+            Self::MouseButton { .. } => "mouse_button",
+            Self::Key { .. } => "key",
+            Self::Modifier { .. } => "modifier",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

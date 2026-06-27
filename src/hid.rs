@@ -24,6 +24,8 @@ use tracing::trace;
 #[cfg(unix)]
 use tracing::warn;
 
+#[cfg(unix)]
+use crate::latency;
 use crate::protocol::InputEvent;
 #[cfg(unix)]
 use crate::protocol::{KeyCode, KeyState, MacModifier, MacModifierPolicy, MouseButton};
@@ -424,6 +426,7 @@ impl KarabinerClient {
     }
 
     async fn write_request_bodies(&self, bodies: Vec<Vec<u8>>) -> Result<()> {
+        let body_count = bodies.len();
         let mut wire = Vec::new();
         for body in bodies {
             let len = u32::try_from(body.len()).context("Karabiner frame too large")?;
@@ -437,12 +440,14 @@ impl KarabinerClient {
         let write_started = Instant::now();
         writer.write_all(&wire).await?;
         let write_elapsed = write_started.elapsed();
-        if lock_elapsed >= Duration::from_millis(5) || write_elapsed >= Duration::from_millis(10) {
+        if latency::report(lock_elapsed) || latency::report(write_elapsed) {
             warn!(
+                target: "softkvm::latency",
+                bodies = body_count,
                 bytes,
-                lock_ms = lock_elapsed.as_millis(),
-                write_ms = write_elapsed.as_millis(),
-                "Karabiner write was slow"
+                lock_ms = latency::ms(lock_elapsed),
+                write_ms = latency::ms(write_elapsed),
+                "Karabiner write latency"
             );
         }
         Ok(())
