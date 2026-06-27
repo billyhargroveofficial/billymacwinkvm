@@ -87,6 +87,8 @@ def analyze(path: Path):
             series["mac_tcp_motion"].append((ts, line_no))
         if "mac input sink apply latency" in line and 'event="mouse_motion"' in line:
             series["mac_apply_motion"].append((ts, line_no))
+        if "mac motion coalesced flush" in line:
+            series["mac_motion_coalesced_flush"].append((ts, line_no))
         if "Karabiner write latency" in line:
             series["karabiner_write"].append((ts, line_no))
         if "windows udp motion send latency" in line:
@@ -105,6 +107,8 @@ def analyze(path: Path):
                     label = "mac_tcp_queue_ms"
                 elif "mac motion apply latency" in line and key == "elapsed_ms":
                     label = "mac_motion_apply_ms"
+                elif "mac motion coalesced flush" in line and key == "queued_ms":
+                    label = "mac_motion_coalesced_queue_ms"
                 elif "mac input sink apply latency" in line and key == "elapsed_ms":
                     label = "mac_input_apply_ms"
                 elif "Karabiner write latency" in line:

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::net::UdpSocket as StdUdpSocket;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -210,42 +210,26 @@ impl MotionTransport {
 
 #[derive(Clone)]
 struct SharedUdpMotionWriter {
-    inner: Arc<Mutex<UdpMotionWriterState>>,
-}
-
-struct UdpMotionWriterState {
-    socket: StdUdpSocket,
-    seq: u64,
-    confirmed: bool,
+    socket: Arc<StdUdpSocket>,
+    seq: Arc<AtomicU64>,
+    confirmed: Arc<AtomicBool>,
 }
 
 impl SharedUdpMotionWriter {
     fn new(socket: StdUdpSocket) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(UdpMotionWriterState {
-                socket,
-                seq: 1,
-                confirmed: false,
-            })),
+            socket: Arc::new(socket),
+            seq: Arc::new(AtomicU64::new(1)),
+            confirmed: Arc::new(AtomicBool::new(false)),
         }
     }
 
     fn confirmed(&self) -> bool {
-        self.inner
-            .lock()
-            .map(|state| state.confirmed)
-            .unwrap_or(false)
+        self.confirmed.load(Ordering::Acquire)
     }
 
     fn confirm(&self) -> bool {
-        let Ok(mut state) = self.inner.lock() else {
-            return false;
-        };
-        if state.confirmed {
-            return false;
-        }
-        state.confirmed = true;
-        true
+        !self.confirmed.swap(true, Ordering::AcqRel)
     }
 
     fn send_motion_if_confirmed(&self, dx: i32, dy: i32, path: &'static str) -> Result<bool> {
@@ -257,18 +241,14 @@ impl SharedUdpMotionWriter {
     }
 
     fn send_motion(&self, dx: i32, dy: i32, path: &'static str) -> Result<()> {
-        let mut state = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow!("udp motion writer lock poisoned"))?;
         let packet = MotionDatagram {
-            seq: state.seq,
+            seq: self.seq.fetch_add(1, Ordering::Relaxed),
             dx: dx.clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH),
             dy: dy.clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH),
         };
         let encoded = packet.encode();
         let started = Instant::now();
-        let sent = state
+        let sent = self
             .socket
             .send(&encoded)
             .context("send udp motion packet")?;
@@ -287,7 +267,6 @@ impl SharedUdpMotionWriter {
                 "windows udp motion send latency"
             );
         }
-        state.seq = state.seq.wrapping_add(1);
         Ok(())
     }
 }

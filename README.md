@@ -65,6 +65,14 @@ Package a versioned Windows transfer zip:
 Each run bumps `kit-version.txt` and writes `dist/softkvm-windows-test-kit-vNNNN-<git>.zip`
 plus `dist/softkvm-windows-test-kit-latest.zip`.
 
+macOS receiver coalesces high-rate mouse deltas before writing to Karabiner.
+Default flush interval is `2ms`; for real-machine tuning:
+
+```bash
+SOFTKVM_MAC_MOTION_FLUSH_MS=1 ./scripts/mac-karabiner-client.sh
+SOFTKVM_MAC_MOTION_FLUSH_MS=4 ./scripts/mac-karabiner-client.sh
+```
+
 ## Docs
 
 - `docs/architecture.md`

@@ -21,7 +21,7 @@ use tokio::net::{
     tcp::{OwnedReadHalf, OwnedWriteHalf},
 };
 use tokio::sync::mpsc;
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, MissedTickBehavior, interval, sleep};
 use tracing::{info, trace, warn};
 use uuid::Uuid;
 
@@ -29,6 +29,7 @@ const MAC_RIGHT_EDGE_RELEASE_REARM_PX: f64 = 48.0;
 #[cfg(target_os = "macos")]
 const MAC_EDGE_ENTRY_GAP_PX: f64 = 2.0;
 const MAX_MOTION_DELTA_PER_FLUSH: i32 = 512;
+const DEFAULT_MAC_MOTION_FLUSH_INTERVAL_MS: u64 = 2;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -68,6 +69,10 @@ fn build_info() -> Result<()> {
     println!("build_git_hash {}", env!("SOFTKVM_BUILD_GIT_HASH"));
     println!("protocol_version {}", protocol::PROTOCOL_VERSION);
     println!("motion_transport udp-binary-skm1-with-tcp-fallback");
+    println!(
+        "mac_motion_flush default_ms={} env=SOFTKVM_MAC_MOTION_FLUSH_MS",
+        DEFAULT_MAC_MOTION_FLUSH_INTERVAL_MS
+    );
     Ok(())
 }
 
@@ -175,10 +180,26 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
         let mut saw_frame = false;
         let mut touched_input = false;
         let mut read_error = None;
+        let mut motion_flush_timer = interval(mac_motion_flush_interval());
+        motion_flush_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
             let event = {
                 tokio::select! {
+                    biased;
+
+                    _ = motion_flush_timer.tick(), if client_state.has_pending_motion() => {
+                        touched_input = true;
+                        flush_client_motion(
+                            &mut hid_sink,
+                            sink,
+                            &mut writer,
+                            client_session_id,
+                            &mut client_seq,
+                            &mut client_state,
+                        ).await;
+                        continue;
+                    }
                     event = frame_rx.recv() => {
                         let Some(event) = event else {
                             break;
@@ -237,19 +258,12 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
                         continue;
                     }
                     touched_input = true;
-                    handle_client_motion(
-                        &mut hid_sink,
-                        sink,
-                        &mut writer,
-                        client_session_id,
-                        &mut client_seq,
-                        &mut client_state,
+                    client_state.queue_motion(
                         motion.packet.dx,
                         motion.packet.dy,
                         "udp",
                         motion.packet.seq,
-                    )
-                    .await;
+                    );
                     continue;
                 }
                 ClientEvent::Tcp(ClientReadEvent::Frame { frame, read_at }) => (frame, read_at),
@@ -283,6 +297,17 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
                     info!(?hello, "host hello");
                 }
                 Message::HostState(state) => {
+                    if client_state.has_pending_motion() {
+                        flush_client_motion(
+                            &mut hid_sink,
+                            sink,
+                            &mut writer,
+                            client_session_id,
+                            &mut client_seq,
+                            &mut client_state,
+                        )
+                        .await;
+                    }
                     info!(?state, "host state");
                     client_state.set_remote_active(state.remote_active);
                     if state.remote_active {
@@ -302,20 +327,20 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
                     }
 
                     if let InputEvent::MouseMotion { dx, dy } = event {
-                        handle_client_motion(
+                        client_state.queue_motion(dx, dy, "tcp", frame_seq);
+                        continue;
+                    }
+
+                    if client_state.has_pending_motion() {
+                        flush_client_motion(
                             &mut hid_sink,
                             sink,
                             &mut writer,
                             client_session_id,
                             &mut client_seq,
                             &mut client_state,
-                            dx,
-                            dy,
-                            "tcp",
-                            frame_seq,
                         )
                         .await;
-                        continue;
                     }
 
                     if client_state.should_release_for_hotkey(&event) {
@@ -338,6 +363,7 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
                 }
                 Message::InputReset => {
                     touched_input = true;
+                    client_state.clear_pending_motion();
                     client_state.reset_keys();
                     reset_input(&mut hid_sink, sink).await;
                 }
@@ -508,6 +534,47 @@ async fn handle_client_motion(
     false
 }
 
+async fn flush_client_motion(
+    hid_sink: &mut Box<dyn HidSink>,
+    sink: SinkKind,
+    writer: &mut transport::FrameWriter<OwnedWriteHalf>,
+    client_session_id: Uuid,
+    client_seq: &mut u64,
+    client_state: &mut ClientRuntimeState,
+) -> bool {
+    let Some(motion) = client_state.take_pending_motion() else {
+        return false;
+    };
+
+    let queued_elapsed = motion.queued_at.elapsed();
+    if motion.event_count > 1 || latency::report(queued_elapsed) {
+        info!(
+            target: "softkvm::latency",
+            source = motion.source,
+            source_seq = motion.source_seq,
+            event_count = motion.event_count,
+            dx = motion.dx,
+            dy = motion.dy,
+            queued_ms = latency::ms(queued_elapsed),
+            "mac motion coalesced flush"
+        );
+    }
+
+    handle_client_motion(
+        hid_sink,
+        sink,
+        writer,
+        client_session_id,
+        client_seq,
+        client_state,
+        motion.dx,
+        motion.dy,
+        motion.source,
+        motion.source_seq,
+    )
+    .await
+}
+
 async fn request_host_release(
     hid_sink: &mut Box<dyn HidSink>,
     sink: SinkKind,
@@ -575,12 +642,23 @@ struct ClientRuntimeState {
     right_edge_release_armed: bool,
     just_activated: bool,
     udp_motion_ready_sent: bool,
+    pending_motion: Option<PendingClientMotion>,
+}
+
+struct PendingClientMotion {
+    dx: i32,
+    dy: i32,
+    source: &'static str,
+    source_seq: u64,
+    event_count: u32,
+    queued_at: Instant,
 }
 
 impl ClientRuntimeState {
     fn set_remote_active(&mut self, active: bool) {
         self.remote_active = active;
         self.reset_keys();
+        self.clear_pending_motion();
         self.right_edge_release_armed = false;
         self.just_activated = active;
         self.udp_motion_ready_sent = false;
@@ -588,6 +666,44 @@ impl ClientRuntimeState {
 
     fn reset_keys(&mut self) {
         self.active_modifiers.clear();
+    }
+
+    fn has_pending_motion(&self) -> bool {
+        self.pending_motion.is_some()
+    }
+
+    fn clear_pending_motion(&mut self) {
+        self.pending_motion = None;
+    }
+
+    fn queue_motion(&mut self, dx: i32, dy: i32, source: &'static str, source_seq: u64) {
+        if !self.remote_active || (dx == 0 && dy == 0) {
+            return;
+        }
+
+        match &mut self.pending_motion {
+            Some(pending) => {
+                pending.dx = pending.dx.saturating_add(dx);
+                pending.dy = pending.dy.saturating_add(dy);
+                pending.source = source;
+                pending.source_seq = source_seq;
+                pending.event_count = pending.event_count.saturating_add(1);
+            }
+            None => {
+                self.pending_motion = Some(PendingClientMotion {
+                    dx,
+                    dy,
+                    source,
+                    source_seq,
+                    event_count: 1,
+                    queued_at: Instant::now(),
+                });
+            }
+        }
+    }
+
+    fn take_pending_motion(&mut self) -> Option<PendingClientMotion> {
+        self.pending_motion.take()
     }
 
     fn should_release_for_hotkey(&mut self, event: &InputEvent) -> bool {
@@ -643,6 +759,15 @@ async fn make_sink(sink: SinkKind) -> Result<Box<dyn HidSink>> {
         SinkKind::Karabiner => hid::karabiner_sink_async().await,
         SinkKind::NativeHid => hid::native_hid_sink_async().await,
     }
+}
+
+fn mac_motion_flush_interval() -> Duration {
+    let millis = std::env::var("SOFTKVM_MAC_MOTION_FLUSH_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MAC_MOTION_FLUSH_INTERVAL_MS)
+        .clamp(1, 16);
+    Duration::from_millis(millis)
 }
 
 #[cfg(target_os = "macos")]
