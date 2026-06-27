@@ -5,6 +5,7 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::net::TcpStream;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -12,8 +13,11 @@ use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, 
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey,
-    VK_CONTROL, VK_ESCAPE, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_OEM_5,
-    VK_RCONTROL, VK_RETURN, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB,
+    VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_INSERT,
+    VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_OEM_1, VK_OEM_2,
+    VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_102, VK_OEM_COMMA, VK_OEM_MINUS,
+    VK_OEM_PERIOD, VK_OEM_PLUS, VK_PAUSE, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU,
+    VK_RSHIFT, VK_RWIN, VK_SCROLL, VK_SHIFT, VK_SNAPSHOT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Input::{
     GetRawInputData, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT,
@@ -33,14 +37,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::w;
 
 use crate::protocol::{
-    Frame, HostStateEvent, InputEvent, KeyCode, KeyState, Message, Modifier, MouseButton,
-    ProtocolHello,
+    ClientControlEvent, Frame, HostStateEvent, InputEvent, KeyCode, KeyState, Message, Modifier,
+    MouseButton, ProtocolHello,
 };
 use crate::transport::FrameWriter;
 
 const HOTKEY_ID_TOGGLE_BACKSLASH: i32 = 1;
+const HOTKEY_ID_TOGGLE_NON_US_BACKSLASH: i32 = 2;
 const EDGE_TRIGGER_PX: i32 = 8;
 const WHEEL_DELTA: i32 = 120;
+const SCANCODE_BACKSLASH: u32 = 0x2b;
+const SCANCODE_NON_US_BACKSLASH: u32 = 0x56;
 
 static HOST_STATE: OnceLock<Mutex<HostState>> = OnceLock::new();
 
@@ -58,13 +65,15 @@ pub async fn run_host(peer: String, layout: String) -> Result<()> {
         .set(Mutex::new(HostState::new(tx, layout.clone())))
         .map_err(|_| anyhow!("Windows host state was already initialized"))?;
 
-    tokio::spawn(writer_task(stream, rx));
+    let (read_half, write_half) = stream.into_split();
+    tokio::spawn(writer_task(write_half, rx));
+    tokio::spawn(control_reader_task(read_half));
 
     info!(%peer, %layout, "starting Windows host capture");
     run_message_loop().context("run Windows host message loop")
 }
 
-async fn writer_task(stream: TcpStream, mut rx: mpsc::UnboundedReceiver<HostCommand>) {
+async fn writer_task(stream: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<HostCommand>) {
     let mut writer = FrameWriter::new(stream);
     let session_id = Uuid::new_v4();
     let mut seq = 1_u64;
@@ -107,6 +116,38 @@ async fn writer_task(stream: TcpStream, mut rx: mpsc::UnboundedReceiver<HostComm
             break;
         }
         seq += 1;
+    }
+}
+
+async fn control_reader_task(stream: OwnedReadHalf) {
+    let mut reader = crate::transport::FrameReader::new(stream);
+
+    loop {
+        let frame = match reader.read_frame().await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                warn!("host control reader disconnected");
+                break;
+            }
+            Err(err) => {
+                warn!(?err, "host control reader failed");
+                break;
+            }
+        };
+
+        if let Message::ClientControl(ClientControlEvent::ReleaseHost { reason }) = frame.message {
+            info!(%reason, "client requested host release");
+            match lock_state() {
+                Ok(mut state) => {
+                    if state.remote_active
+                        && let Err(err) = state.set_remote_active(false, "mac right edge")
+                    {
+                        warn!(?err, "failed to release host from client control");
+                    }
+                }
+                Err(err) => warn!(?err, "failed to lock host state for client control"),
+            }
+        }
     }
 }
 
@@ -212,19 +253,32 @@ unsafe fn register_input(hwnd: HWND) -> Result<()> {
 
 unsafe fn register_hotkey(hwnd: HWND) -> Result<()> {
     let modifiers = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
-    unsafe {
-        RegisterHotKey(
-            Some(hwnd),
-            HOTKEY_ID_TOGGLE_BACKSLASH,
-            modifiers,
-            u32::from(VK_OEM_5.0),
-        )
-        .context("RegisterHotKey Ctrl+Alt+\\")
+
+    let mut registered = false;
+    for (id, vkey, name) in [
+        (HOTKEY_ID_TOGGLE_BACKSLASH, VK_OEM_5.0, "VK_OEM_5"),
+        (
+            HOTKEY_ID_TOGGLE_NON_US_BACKSLASH,
+            VK_OEM_102.0,
+            "VK_OEM_102",
+        ),
+    ] {
+        match unsafe { RegisterHotKey(Some(hwnd), id, modifiers, u32::from(vkey)) } {
+            Ok(()) => registered = true,
+            Err(err) => warn!(?err, name, "RegisterHotKey Ctrl+Alt+\\ failed"),
+        }
+    }
+
+    if registered {
+        Ok(())
+    } else {
+        bail!("RegisterHotKey Ctrl+Alt+\\ failed for both backslash keys")
     }
 }
 
 unsafe fn unregister_hotkeys(hwnd: HWND) {
     let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_ID_TOGGLE_BACKSLASH) };
+    let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_ID_TOGGLE_NON_US_BACKSLASH) };
 }
 
 unsafe extern "system" fn wnd_proc(
@@ -234,7 +288,12 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
-        WM_HOTKEY if wparam.0 as i32 == HOTKEY_ID_TOGGLE_BACKSLASH => {
+        WM_HOTKEY
+            if matches!(
+                wparam.0 as i32,
+                HOTKEY_ID_TOGGLE_BACKSLASH | HOTKEY_ID_TOGGLE_NON_US_BACKSLASH
+            ) =>
+        {
             if let Err(err) = toggle_remote("hotkey Ctrl+Alt+\\") {
                 error!(?err, "toggle failed");
             }
@@ -378,9 +437,19 @@ fn handle_keyboard(raw: RAWINPUT) -> Result<()> {
         KeyState::Down
     };
     let vkey = keyboard.VKey;
+    let make_code = u32::from(keyboard.MakeCode);
 
     let mut state = lock_state()?;
     let events = state.keyboard_events(vkey, key_state);
+    if state.remote_active
+        && key_state == KeyState::Down
+        && is_backslash_key(vkey, make_code)
+        && state.control_alt_active()
+    {
+        state.set_remote_active(false, "hotkey Ctrl+Alt+\\")?;
+        return Ok(());
+    }
+
     if state.remote_active {
         for event in events {
             state.send(HostCommand::Input(event))?;
@@ -436,7 +505,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
         let message = wparam.0 as u32;
         if message == WM_KEYDOWN || message == WM_SYSKEYDOWN {
             let key = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-            if key.vkCode == u32::from(VK_OEM_5.0) && ctrl_alt_down() {
+            if is_backslash_key(key.vkCode as u16, key.scanCode) && ctrl_alt_down() {
                 if let Err(err) = toggle_remote("hotkey Ctrl+Alt+\\") {
                     error!(?err, "toggle failed");
                 }
@@ -466,6 +535,13 @@ fn ctrl_alt_down() -> bool {
 
 fn key_down(vkey: u16) -> bool {
     unsafe { GetAsyncKeyState(i32::from(vkey)) < 0 }
+}
+
+fn is_backslash_key(vkey: u16, scan_code: u32) -> bool {
+    vkey == VK_OEM_5.0
+        || vkey == VK_OEM_102.0
+        || scan_code == SCANCODE_BACKSLASH
+        || scan_code == SCANCODE_NON_US_BACKSLASH
 }
 
 fn lock_state() -> Result<std::sync::MutexGuard<'static, HostState>> {
@@ -579,6 +655,11 @@ impl HostState {
         }
     }
 
+    fn control_alt_active(&self) -> bool {
+        self.active_modifiers.contains(&Modifier::Control)
+            && self.active_modifiers.contains(&Modifier::Alt)
+    }
+
     fn capture_local_controls(&mut self) -> Result<()> {
         let cursor = current_cursor_position().unwrap_or_else(|_| POINT {
             x: unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) },
@@ -670,12 +751,66 @@ fn modifier_for_vkey(vkey: u16) -> Option<Modifier> {
 }
 
 fn key_for_vkey(vkey: u16) -> KeyCode {
+    if let Some(usage) = usb_usage_for_vkey(vkey) {
+        match usage {
+            0x28 => KeyCode::Enter,
+            0x29 => KeyCode::Escape,
+            0x2b => KeyCode::Tab,
+            0x2c => KeyCode::Space,
+            0x31 => KeyCode::Backslash,
+            _ => KeyCode::Usb(usage),
+        }
+    } else {
+        KeyCode::Other(u32::from(vkey))
+    }
+}
+
+fn usb_usage_for_vkey(vkey: u16) -> Option<u16> {
+    if (0x41..=0x5a).contains(&vkey) {
+        return Some(0x04 + (vkey - 0x41));
+    }
+    if (0x31..=0x39).contains(&vkey) {
+        return Some(0x1e + (vkey - 0x31));
+    }
+    if vkey == 0x30 {
+        return Some(0x27);
+    }
+    if (0x70..=0x7b).contains(&vkey) {
+        return Some(0x3a + (vkey - 0x70));
+    }
+
     match vkey {
-        v if v == VK_OEM_5.0 => KeyCode::Backslash,
-        v if v == VK_ESCAPE.0 => KeyCode::Escape,
-        v if v == VK_SPACE.0 => KeyCode::Space,
-        v if v == VK_RETURN.0 => KeyCode::Enter,
-        v if v == VK_TAB.0 => KeyCode::Tab,
-        _ => KeyCode::Other(u32::from(vkey)),
+        v if v == VK_RETURN.0 => Some(0x28),
+        v if v == VK_ESCAPE.0 => Some(0x29),
+        v if v == VK_BACK.0 => Some(0x2a),
+        v if v == VK_TAB.0 => Some(0x2b),
+        v if v == VK_SPACE.0 => Some(0x2c),
+        v if v == VK_OEM_MINUS.0 => Some(0x2d),
+        v if v == VK_OEM_PLUS.0 => Some(0x2e),
+        v if v == VK_OEM_4.0 => Some(0x2f),
+        v if v == VK_OEM_6.0 => Some(0x30),
+        v if v == VK_OEM_5.0 => Some(0x31),
+        v if v == VK_OEM_1.0 => Some(0x33),
+        v if v == VK_OEM_7.0 => Some(0x34),
+        v if v == VK_OEM_3.0 => Some(0x35),
+        v if v == VK_OEM_COMMA.0 => Some(0x36),
+        v if v == VK_OEM_PERIOD.0 => Some(0x37),
+        v if v == VK_OEM_2.0 => Some(0x38),
+        v if v == VK_CAPITAL.0 => Some(0x39),
+        v if v == VK_SNAPSHOT.0 => Some(0x46),
+        v if v == VK_SCROLL.0 => Some(0x47),
+        v if v == VK_PAUSE.0 => Some(0x48),
+        v if v == VK_INSERT.0 => Some(0x49),
+        v if v == VK_HOME.0 => Some(0x4a),
+        v if v == VK_PRIOR.0 => Some(0x4b),
+        v if v == VK_DELETE.0 => Some(0x4c),
+        v if v == VK_END.0 => Some(0x4d),
+        v if v == VK_NEXT.0 => Some(0x4e),
+        v if v == VK_RIGHT.0 => Some(0x4f),
+        v if v == VK_LEFT.0 => Some(0x50),
+        v if v == VK_DOWN.0 => Some(0x51),
+        v if v == VK_UP.0 => Some(0x52),
+        v if v == VK_OEM_102.0 => Some(0x64),
+        _ => None,
     }
 }

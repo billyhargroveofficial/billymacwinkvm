@@ -2,11 +2,23 @@ use anyhow::Result;
 #[cfg(unix)]
 use anyhow::{Context, bail};
 use serde::Serialize;
+#[cfg(unix)]
+use std::collections::HashSet;
+#[cfg(unix)]
+use std::sync::Arc;
+#[cfg(unix)]
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(unix)]
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+#[cfg(unix)]
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
+#[cfg(unix)]
+use tracing::warn;
 
 use crate::protocol::InputEvent;
 #[cfg(unix)]
-use crate::protocol::{KeyState, MacModifier, MacModifierPolicy, MouseButton};
+use crate::protocol::{KeyCode, KeyState, MacModifier, MacModifierPolicy, MouseButton};
 
 #[async_trait::async_trait]
 pub trait HidSink: Send {
@@ -100,6 +112,7 @@ struct KarabinerSink {
     client: KarabinerClient,
     buttons: u32,
     modifiers: u8,
+    keys: HashSet<u16>,
     modifier_policy: MacModifierPolicy,
 }
 
@@ -113,6 +126,7 @@ impl KarabinerSink {
             client,
             buttons: 0,
             modifiers: 0,
+            keys: HashSet::new(),
             modifier_policy: MacModifierPolicy::SwapAltSuper,
         })
     }
@@ -141,9 +155,13 @@ impl KarabinerSink {
     }
 
     async fn post_keyboard_state(&mut self) -> Result<()> {
-        self.client
-            .post_keyboard(self.modifiers, &[0_u16; 32])
-            .await
+        let mut keys = [0_u16; 32];
+        let mut pressed = self.keys.iter().copied().collect::<Vec<_>>();
+        pressed.sort_unstable();
+        for (slot, key) in keys.iter_mut().zip(pressed.into_iter()) {
+            *slot = key;
+        }
+        self.client.post_keyboard(self.modifiers, &keys).await
     }
 }
 
@@ -170,10 +188,19 @@ impl HidSink for KarabinerSink {
                 }
                 self.post_keyboard_state().await
             }
-            InputEvent::Key { .. } => {
-                // Ordinary key mapping is wired after Windows scan-code capture. Modifiers are
-                // enough for the first HID proof and prevent accidentally typing into apps.
-                Ok(())
+            InputEvent::Key { key, state } => {
+                let Some(usage) = mac_key_usage(key) else {
+                    return Ok(());
+                };
+                match state {
+                    KeyState::Down => {
+                        self.keys.insert(usage);
+                    }
+                    KeyState::Up => {
+                        self.keys.remove(&usage);
+                    }
+                }
+                self.post_keyboard_state().await
             }
         }
     }
@@ -181,6 +208,7 @@ impl HidSink for KarabinerSink {
     async fn reset(&mut self) -> Result<()> {
         self.buttons = 0;
         self.modifiers = 0;
+        self.keys.clear();
         self.client.post_pointing(0, 0, 0, 0, 0).await?;
         self.post_keyboard_state().await
     }
@@ -209,6 +237,19 @@ fn mac_modifier_bit(modifier: MacModifier) -> u8 {
 }
 
 #[cfg(unix)]
+fn mac_key_usage(key: KeyCode) -> Option<u16> {
+    match key {
+        KeyCode::Backslash => Some(0x31),
+        KeyCode::Escape => Some(0x29),
+        KeyCode::Space => Some(0x2c),
+        KeyCode::Enter => Some(0x28),
+        KeyCode::Tab => Some(0x2b),
+        KeyCode::Usb(usage) if usage != 0 => Some(usage),
+        KeyCode::Usb(_) | KeyCode::Other(_) => None,
+    }
+}
+
+#[cfg(unix)]
 fn take_i8_chunk(value: &mut i32) -> i8 {
     let chunk = (*value).clamp(i8::MIN as i32, i8::MAX as i32);
     *value -= chunk;
@@ -217,7 +258,7 @@ fn take_i8_chunk(value: &mut i32) -> i8 {
 
 #[cfg(unix)]
 struct KarabinerClient {
-    stream: tokio::net::UnixStream,
+    writer: Arc<AsyncMutex<OwnedWriteHalf>>,
     next_request_id: u64,
 }
 
@@ -227,8 +268,11 @@ impl KarabinerClient {
         let stream = tokio::net::UnixStream::connect(path)
             .await
             .with_context(|| format!("connect Karabiner socket {path}"))?;
+        let (reader, writer) = stream.into_split();
+        let writer = Arc::new(AsyncMutex::new(writer));
+        tokio::spawn(karabiner_reader_task(reader, writer.clone()));
         Ok(Self {
-            stream,
+            writer,
             next_request_id: 1,
         })
     }
@@ -293,61 +337,81 @@ impl KarabinerClient {
         body.extend_from_slice(&request_id.to_be_bytes());
         body.extend_from_slice(&karabiner_payload);
 
-        let len = u32::try_from(body.len()).context("Karabiner frame too large")?;
-        tokio::io::AsyncWriteExt::write_all(&mut self.stream, &len.to_be_bytes()).await?;
-        tokio::io::AsyncWriteExt::write_all(&mut self.stream, &body).await?;
-        tokio::io::AsyncWriteExt::flush(&mut self.stream).await?;
-
-        self.read_response(request_id).await
+        let mut writer = self.writer.lock().await;
+        write_karabiner_body(&mut *writer, &body).await
     }
+}
 
-    async fn read_response(&mut self, request_id: u64) -> Result<()> {
-        loop {
-            let mut len = [0_u8; 4];
-            tokio::io::AsyncReadExt::read_exact(&mut self.stream, &mut len).await?;
-            let len = u32::from_be_bytes(len) as usize;
-            if len == 0 {
-                bail!("Karabiner frame is empty");
+#[cfg(unix)]
+async fn karabiner_reader_task(mut reader: OwnedReadHalf, writer: Arc<AsyncMutex<OwnedWriteHalf>>) {
+    loop {
+        let body = match read_karabiner_body(&mut reader).await {
+            Ok(body) => body,
+            Err(err) => {
+                warn!(?err, "Karabiner reader stopped");
+                break;
             }
+        };
 
-            let mut body = vec![0_u8; len];
-            tokio::io::AsyncReadExt::read_exact(&mut self.stream, &mut body).await?;
-
-            match body[0] {
-                0 => {
-                    // heartbeat
+        match body[0] {
+            0 => {
+                // heartbeat
+            }
+            2 => {
+                let mut writer = writer.lock().await;
+                if let Err(err) = write_control_frame(&mut *writer, 3, &[]).await {
+                    warn!(?err, "failed to answer Karabiner health_check");
+                    break;
                 }
-                2 => {
-                    // health_check
-                    self.write_control_frame(3, &[]).await?;
-                }
-                5 => {
-                    if body.len() < 9 {
-                        bail!("Karabiner response frame is too short");
-                    }
-                    let response_id = u64::from_be_bytes(body[1..9].try_into()?);
-                    if response_id == request_id {
-                        return Ok(());
-                    }
-                }
-                _ => {
-                    // Ignore unrelated protocol frames while waiting for our response.
-                }
+            }
+            5 => {
+                // response; requests are pipelined so input events do not wait on this path.
+            }
+            _ => {
+                // Ignore unrelated protocol frames.
             }
         }
     }
+}
 
-    async fn write_control_frame(&mut self, message_type: u8, payload: &[u8]) -> Result<()> {
-        let len = 1 + payload.len();
-        let len = u32::try_from(len).context("Karabiner control frame too large")?;
-        tokio::io::AsyncWriteExt::write_all(&mut self.stream, &len.to_be_bytes()).await?;
-        tokio::io::AsyncWriteExt::write_all(&mut self.stream, &[message_type]).await?;
-        if !payload.is_empty() {
-            tokio::io::AsyncWriteExt::write_all(&mut self.stream, payload).await?;
-        }
-        tokio::io::AsyncWriteExt::flush(&mut self.stream).await?;
-        Ok(())
+#[cfg(unix)]
+async fn read_karabiner_body<R>(reader: &mut R) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut len = [0_u8; 4];
+    reader.read_exact(&mut len).await?;
+    let len = u32::from_be_bytes(len) as usize;
+    if len == 0 {
+        bail!("Karabiner frame is empty");
     }
+
+    let mut body = vec![0_u8; len];
+    reader.read_exact(&mut body).await?;
+    Ok(body)
+}
+
+#[cfg(unix)]
+async fn write_control_frame<W>(writer: &mut W, message_type: u8, payload: &[u8]) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut body = Vec::with_capacity(1 + payload.len());
+    body.push(message_type);
+    body.extend_from_slice(payload);
+    write_karabiner_body(writer, &body).await
+}
+
+#[cfg(unix)]
+async fn write_karabiner_body<W>(writer: &mut W, body: &[u8]) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let len = u32::try_from(body.len()).context("Karabiner frame too large")?;
+    writer.write_all(&len.to_be_bytes()).await?;
+    writer.write_all(body).await?;
+    writer.flush().await?;
+    Ok(())
 }
 
 #[cfg(unix)]

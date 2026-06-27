@@ -25,6 +25,7 @@ pub enum Message {
     Hello(ProtocolHello),
     Heartbeat { monotonic_ms: u64 },
     HostState(HostStateEvent),
+    ClientControl(ClientControlEvent),
     Input(InputEvent),
     InputReset,
 }
@@ -40,6 +41,11 @@ pub struct ProtocolHello {
 pub struct HostStateEvent {
     pub remote_active: bool,
     pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum ClientControlEvent {
+    ReleaseHost { reason: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -96,6 +102,7 @@ pub enum KeyCode {
     Space,
     Enter,
     Tab,
+    Usb(u16),
     Other(u32),
 }
 

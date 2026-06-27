@@ -1,17 +1,18 @@
-use anyhow::{Context, Result, bail};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-
 use crate::protocol::Frame;
+use anyhow::{Context, Result, bail};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
-pub struct FrameReader {
-    stream: TcpStream,
+pub struct FrameReader<R> {
+    stream: R,
 }
 
-impl FrameReader {
-    pub fn new(stream: TcpStream) -> Self {
+impl<R> FrameReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    pub fn new(stream: R) -> Self {
         Self { stream }
     }
 
@@ -45,12 +46,15 @@ impl FrameReader {
     }
 }
 
-pub struct FrameWriter {
-    stream: TcpStream,
+pub struct FrameWriter<W> {
+    stream: W,
 }
 
-impl FrameWriter {
-    pub fn new(stream: TcpStream) -> Self {
+impl<W> FrameWriter<W>
+where
+    W: AsyncWrite + Unpin,
+{
+    pub fn new(stream: W) -> Self {
         Self { stream }
     }
 
@@ -74,7 +78,7 @@ impl FrameWriter {
 
 #[cfg(test)]
 mod tests {
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
     use uuid::Uuid;
 
     use super::*;
