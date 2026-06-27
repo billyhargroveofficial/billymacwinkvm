@@ -48,7 +48,7 @@ Write-Host "== Synthetic probe =="
 Write-Host ""
 if ($RunHost) {
   Write-Host "== Real host =="
-  Write-Host "Press Ctrl+C here to stop. Toggle remote mode with Ctrl+Alt+\ or Ctrl+Alt+F12."
+  Write-Host "Press Ctrl+C here to stop. Toggle remote mode with Ctrl+Alt+\."
   & $Exe host --peer $Peer --layout $Layout
 } else {
   Write-Host "PASS: preflight probe reached Mac."
