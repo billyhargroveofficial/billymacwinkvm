@@ -56,6 +56,15 @@ Real Windows preflight:
 .\scripts\windows-real-preflight.ps1 -Exe .\softkvm.exe -Peer <mac-lan-ip>:49321
 ```
 
+Package a versioned Windows transfer zip:
+
+```bash
+./scripts/package-windows-kit.sh
+```
+
+Each run bumps `kit-version.txt` and writes `dist/softkvm-windows-test-kit-vNNNN-<git>.zip`
+plus `dist/softkvm-windows-test-kit-latest.zip`.
+
 ## Docs
 
 - `docs/architecture.md`
