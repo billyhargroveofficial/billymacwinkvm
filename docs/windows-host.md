@@ -1,0 +1,63 @@
+# Windows Host Plan
+
+The Windows host must be a per-user desktop process, not a Windows service. Services cannot reliably capture and suppress interactive user input in the logged-in desktop session.
+
+## Win32 APIs
+
+- `RegisterRawInputDevices`
+- `GetRawInputData`, later `GetRawInputBuffer` for high polling mice
+- `RegisterHotKey`
+- `GetCursorPos`
+- `GetSystemMetrics(SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN)`
+- `ClipCursor`
+- `SetWindowsHookExW(WH_KEYBOARD_LL, WH_MOUSE_LL)`
+- `WM_INPUT`, `WM_HOTKEY`, `WM_DISPLAYCHANGE`, `WM_POWERBROADCAST`
+
+## Input Devices
+
+Register these raw input top-level collections:
+
+- Mouse: usage page `0x01`, usage `0x02`
+- Keyboard: usage page `0x01`, usage `0x06`
+
+Flags:
+
+- `RIDEV_INPUTSINK`
+- `RIDEV_DEVNOTIFY`
+
+## State Machine
+
+```text
+HostActive:
+  observe raw input
+  leave local input alone
+  if cursor crosses Windows left edge -> RemoteActive
+
+RemoteActive:
+  forward raw input to macOS
+  suppress local input with low-level hooks
+  park and clip Windows cursor at left edge
+  Ctrl+Alt+\ -> return to HostActive
+  disconnect/sleep -> release ClipCursor and return HostActive
+```
+
+## Hotkey
+
+`Ctrl+Alt+\` is `MOD_CONTROL | MOD_ALT | MOD_NOREPEAT` with `VK_OEM_5` on common US-like layouts.
+
+While `RemoteActive`, the low-level keyboard hook must detect the chord and post a local toggle message. Do not let the chord leak to Windows apps or the Mac.
+
+## Modifier Mapping
+
+When controlling macOS:
+
+- Windows `Alt` -> macOS `Command`
+- Windows `Super/Win` -> macOS `Option`
+- Windows `Ctrl` -> macOS `Control`
+- Windows `Shift` -> macOS `Shift`
+
+Mapping belongs in the normalized event layer before serialization.
+
+## Startup
+
+Use Task Scheduler at user logon for dev builds. Avoid Windows service for the capture process.
