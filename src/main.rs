@@ -548,7 +548,7 @@ async fn flush_client_motion(
     };
 
     let queued_elapsed = motion.queued_at.elapsed();
-    if motion.event_count > 1 || latency::report(queued_elapsed) {
+    if latency::report(queued_elapsed) {
         info!(
             target: "softkvm::latency",
             source = motion.source,

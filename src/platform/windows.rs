@@ -1311,7 +1311,7 @@ fn handle_raw_input_buffered(lparam: LPARAM) -> Result<()> {
     }
 
     let elapsed = started.elapsed();
-    if total > 1 || latency::report(elapsed) {
+    if latency::report(elapsed) {
         info!(
             target: "softkvm::latency",
             packets = total,
