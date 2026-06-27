@@ -28,7 +28,7 @@ use tracing::warn;
 use crate::latency;
 use crate::protocol::InputEvent;
 #[cfg(unix)]
-use crate::protocol::{KeyCode, KeyState, MacModifier, MacModifierPolicy, MouseButton};
+use crate::protocol::{KeyCode, KeyState, MacModifier, MacModifierPolicy, Modifier, MouseButton};
 
 #[async_trait::async_trait]
 pub trait HidSink: Send {
@@ -109,6 +109,12 @@ pub const KARABINER_SOCKET: &str =
 
 #[cfg(unix)]
 static KARABINER_POINTING_BUTTONS: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_os = "macos")]
+static CGEVENT_POINTING_BUTTONS: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_os = "macos")]
+static CGEVENT_CURSOR_POSITION: std::sync::Mutex<Option<CGPoint>> = std::sync::Mutex::new(None);
+#[cfg(target_os = "macos")]
+static CGEVENT_POINTER_SPEED: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 
 #[cfg(unix)]
 pub async fn karabiner_sink_async() -> Result<Box<dyn HidSink>> {
@@ -141,22 +147,38 @@ pub async fn cgevent_sink_async() -> Result<Box<dyn HidSink>> {
 }
 
 #[cfg(target_os = "macos")]
+pub fn cgevent_note_cursor_position(x: f64, y: f64) {
+    if let Ok(mut position) = CGEVENT_CURSOR_POSITION.lock() {
+        *position = Some(CGPoint { x, y });
+    }
+}
+
+#[cfg(target_os = "macos")]
 struct CgEventSink {
     buttons: u32,
-    keyboard: Box<dyn HidSink>,
+    modifiers: u64,
+    modifier_policy: MacModifierPolicy,
 }
 
 #[cfg(target_os = "macos")]
 impl CgEventSink {
     async fn connect() -> Result<Self> {
-        info!("using CGEvent mouse sink with Karabiner keyboard fallback");
+        let modifier_policy = MacModifierPolicy::from_env();
+        let pointer_speed = cgevent_pointer_speed();
+        info!(
+            ?modifier_policy,
+            pointer_speed,
+            scroll_inverted = true,
+            "using CGEvent mouse and keyboard sink"
+        );
         Ok(Self {
             buttons: 0,
-            keyboard: karabiner_sink_async().await?,
+            modifiers: 0,
+            modifier_policy,
         })
     }
 
-    fn current_position() -> Option<CGPoint> {
+    fn read_current_position() -> Option<CGPoint> {
         let event = unsafe { CGEventCreate(std::ptr::null()) };
         if event.is_null() {
             return None;
@@ -166,19 +188,45 @@ impl CgEventSink {
         Some(point)
     }
 
+    fn cached_position() -> Option<CGPoint> {
+        let mut cached = CGEVENT_CURSOR_POSITION.lock().ok()?;
+        if let Some(point) = *cached {
+            return Some(point);
+        }
+        let point = Self::read_current_position()?;
+        *cached = Some(point);
+        Some(point)
+    }
+
+    fn advance_position(dx: i32, dy: i32) -> Option<CGPoint> {
+        let mut cached = CGEVENT_CURSOR_POSITION.lock().ok()?;
+        let current = match *cached {
+            Some(point) => point,
+            None => {
+                let point = Self::read_current_position()?;
+                *cached = Some(point);
+                point
+            }
+        };
+        let speed = cgevent_pointer_speed();
+        let point = CGPoint {
+            x: current.x + f64::from(dx) * speed,
+            y: current.y + f64::from(dy) * speed,
+        };
+        *cached = Some(point);
+        Some(point)
+    }
+
     fn post_motion(&self, dx: i32, dy: i32) -> Result<()> {
-        let Some(current) = Self::current_position() else {
+        let Some(point) = Self::advance_position(dx, dy) else {
             bail!("CGEventCreate returned null while reading mouse position");
         };
-        let point = CGPoint {
-            x: current.x + f64::from(dx),
-            y: current.y + f64::from(dy),
-        };
-        let event_type = if self.buttons & mouse_button_bit(MouseButton::Left) != 0 {
+        let buttons = CGEVENT_POINTING_BUTTONS.load(Ordering::Relaxed);
+        let event_type = if buttons & mouse_button_bit(MouseButton::Left) != 0 {
             CG_EVENT_LEFT_MOUSE_DRAGGED
-        } else if self.buttons & mouse_button_bit(MouseButton::Right) != 0 {
+        } else if buttons & mouse_button_bit(MouseButton::Right) != 0 {
             CG_EVENT_RIGHT_MOUSE_DRAGGED
-        } else if self.buttons != 0 {
+        } else if buttons != 0 {
             CG_EVENT_OTHER_MOUSE_DRAGGED
         } else {
             CG_EVENT_MOUSE_MOVED
@@ -192,7 +240,8 @@ impl CgEventSink {
             KeyState::Down => self.buttons |= bit,
             KeyState::Up => self.buttons &= !bit,
         }
-        let Some(point) = Self::current_position() else {
+        CGEVENT_POINTING_BUTTONS.store(self.buttons, Ordering::Relaxed);
+        let Some(point) = Self::cached_position() else {
             bail!("CGEventCreate returned null while reading mouse position");
         };
         let (event_type, cg_button) = match (button, state) {
@@ -231,6 +280,8 @@ impl CgEventSink {
     }
 
     fn post_wheel(&self, dx: i32, dy: i32) -> Result<()> {
+        let dx = -dx;
+        let dy = -dy;
         let event = unsafe {
             CGEventCreateScrollWheelEvent(std::ptr::null(), CG_SCROLL_EVENT_UNIT_LINE, 2, dy, dx, 0)
         };
@@ -238,6 +289,37 @@ impl CgEventSink {
             bail!("CGEventCreateScrollWheelEvent returned null");
         }
         unsafe {
+            CGEventPost(CG_HID_EVENT_TAP, event);
+            CFRelease(event.cast_const());
+        }
+        Ok(())
+    }
+
+    fn post_modifier(&mut self, modifier: Modifier, state: KeyState) -> Result<()> {
+        let mapped = self.modifier_policy.map(modifier);
+        let flag = cg_modifier_flag(mapped);
+        match state {
+            KeyState::Down => self.modifiers |= flag,
+            KeyState::Up => self.modifiers &= !flag,
+        }
+        self.post_keycode(cg_modifier_keycode(mapped), state)
+    }
+
+    fn post_key(&self, key: KeyCode, state: KeyState) -> Result<()> {
+        let Some(keycode) = cg_keycode_for_key(key) else {
+            return Ok(());
+        };
+        self.post_keycode(keycode, state)
+    }
+
+    fn post_keycode(&self, keycode: u16, state: KeyState) -> Result<()> {
+        let down = matches!(state, KeyState::Down);
+        let event = unsafe { CGEventCreateKeyboardEvent(std::ptr::null(), keycode, down) };
+        if event.is_null() {
+            bail!("CGEventCreateKeyboardEvent returned null");
+        }
+        unsafe {
+            CGEventSetFlags(event, self.modifiers);
             CGEventPost(CG_HID_EVENT_TAP, event);
             CFRelease(event.cast_const());
         }
@@ -253,15 +335,19 @@ impl HidSink for CgEventSink {
             InputEvent::MouseMotion { dx, dy } => self.post_motion(dx, dy),
             InputEvent::MouseWheel { dx, dy } => self.post_wheel(dx, dy),
             InputEvent::MouseButton { button, state } => self.post_button(button, state),
-            InputEvent::Modifier { .. } | InputEvent::Key { .. } => {
-                self.keyboard.apply(event).await
-            }
+            InputEvent::Modifier { modifier, state } => self.post_modifier(modifier, state),
+            InputEvent::Key { key, state } => self.post_key(key, state),
         }
     }
 
     async fn reset(&mut self) -> Result<()> {
         self.buttons = 0;
-        self.keyboard.reset().await
+        CGEVENT_POINTING_BUTTONS.store(0, Ordering::Relaxed);
+        if let Ok(mut position) = CGEVENT_CURSOR_POSITION.lock() {
+            *position = None;
+        }
+        self.modifiers = 0;
+        Ok(())
     }
 }
 
@@ -575,6 +661,14 @@ const CG_MOUSE_BUTTON_RIGHT: u32 = 1;
 const CG_MOUSE_BUTTON_CENTER: u32 = 2;
 #[cfg(target_os = "macos")]
 const CG_SCROLL_EVENT_UNIT_LINE: u32 = 1;
+#[cfg(target_os = "macos")]
+const CG_EVENT_FLAG_MASK_SHIFT: u64 = 0x0002_0000;
+#[cfg(target_os = "macos")]
+const CG_EVENT_FLAG_MASK_CONTROL: u64 = 0x0004_0000;
+#[cfg(target_os = "macos")]
+const CG_EVENT_FLAG_MASK_ALTERNATE: u64 = 0x0008_0000;
+#[cfg(target_os = "macos")]
+const CG_EVENT_FLAG_MASK_COMMAND: u64 = 0x0010_0000;
 
 #[cfg(target_os = "macos")]
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -595,6 +689,12 @@ unsafe extern "C" {
         wheel2: i32,
         wheel3: i32,
     ) -> *mut std::ffi::c_void;
+    fn CGEventCreateKeyboardEvent(
+        source: *const std::ffi::c_void,
+        virtual_key: u16,
+        key_down: bool,
+    ) -> *mut std::ffi::c_void;
+    fn CGEventSetFlags(event: *mut std::ffi::c_void, flags: u64);
     fn CGEventPost(tap: u32, event: *mut std::ffi::c_void);
     fn CFRelease(cf: *const std::ffi::c_void);
 }
@@ -761,6 +861,133 @@ fn mac_modifier_bit(modifier: MacModifier) -> u8 {
         MacModifier::Shift => 0x02,
         MacModifier::Option => 0x04,
         MacModifier::Command => 0x08,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn cgevent_pointer_speed() -> f64 {
+    *CGEVENT_POINTER_SPEED.get_or_init(|| {
+        std::env::var("SOFTKVM_CGEVENT_POINTER_SPEED")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.5988)
+            .clamp(0.05, 4.0)
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn cg_modifier_flag(modifier: MacModifier) -> u64 {
+    match modifier {
+        MacModifier::Control => CG_EVENT_FLAG_MASK_CONTROL,
+        MacModifier::Shift => CG_EVENT_FLAG_MASK_SHIFT,
+        MacModifier::Option => CG_EVENT_FLAG_MASK_ALTERNATE,
+        MacModifier::Command => CG_EVENT_FLAG_MASK_COMMAND,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn cg_modifier_keycode(modifier: MacModifier) -> u16 {
+    match modifier {
+        MacModifier::Command => 55,
+        MacModifier::Shift => 56,
+        MacModifier::Option => 58,
+        MacModifier::Control => 59,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn cg_keycode_for_key(key: KeyCode) -> Option<u16> {
+    match key {
+        KeyCode::Backslash => Some(42),
+        KeyCode::Escape => Some(53),
+        KeyCode::Space => Some(49),
+        KeyCode::Enter => Some(36),
+        KeyCode::Tab => Some(48),
+        KeyCode::Usb(usage) => cg_keycode_for_usb_usage(usage),
+        KeyCode::Other(_) => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn cg_keycode_for_usb_usage(usage: u16) -> Option<u16> {
+    match usage {
+        0x04 => Some(0),   // A
+        0x05 => Some(11),  // B
+        0x06 => Some(8),   // C
+        0x07 => Some(2),   // D
+        0x08 => Some(14),  // E
+        0x09 => Some(3),   // F
+        0x0a => Some(5),   // G
+        0x0b => Some(4),   // H
+        0x0c => Some(34),  // I
+        0x0d => Some(38),  // J
+        0x0e => Some(40),  // K
+        0x0f => Some(37),  // L
+        0x10 => Some(46),  // M
+        0x11 => Some(45),  // N
+        0x12 => Some(31),  // O
+        0x13 => Some(35),  // P
+        0x14 => Some(12),  // Q
+        0x15 => Some(15),  // R
+        0x16 => Some(1),   // S
+        0x17 => Some(17),  // T
+        0x18 => Some(32),  // U
+        0x19 => Some(9),   // V
+        0x1a => Some(13),  // W
+        0x1b => Some(7),   // X
+        0x1c => Some(16),  // Y
+        0x1d => Some(6),   // Z
+        0x1e => Some(18),  // 1
+        0x1f => Some(19),  // 2
+        0x20 => Some(20),  // 3
+        0x21 => Some(21),  // 4
+        0x22 => Some(23),  // 5
+        0x23 => Some(22),  // 6
+        0x24 => Some(26),  // 7
+        0x25 => Some(28),  // 8
+        0x26 => Some(25),  // 9
+        0x27 => Some(29),  // 0
+        0x28 => Some(36),  // Return
+        0x29 => Some(53),  // Escape
+        0x2a => Some(51),  // Delete/backspace
+        0x2b => Some(48),  // Tab
+        0x2c => Some(49),  // Space
+        0x2d => Some(27),  // -
+        0x2e => Some(24),  // =
+        0x2f => Some(33),  // [
+        0x30 => Some(30),  // ]
+        0x31 => Some(42),  // \
+        0x32 => Some(10),  // Non-US #
+        0x33 => Some(41),  // ;
+        0x34 => Some(39),  // '
+        0x35 => Some(50),  // `
+        0x36 => Some(43),  // ,
+        0x37 => Some(47),  // .
+        0x38 => Some(44),  // /
+        0x39 => Some(57),  // Caps lock
+        0x3a => Some(122), // F1
+        0x3b => Some(120), // F2
+        0x3c => Some(99),  // F3
+        0x3d => Some(118), // F4
+        0x3e => Some(96),  // F5
+        0x3f => Some(97),  // F6
+        0x40 => Some(98),  // F7
+        0x41 => Some(100), // F8
+        0x42 => Some(101), // F9
+        0x43 => Some(109), // F10
+        0x44 => Some(103), // F11
+        0x45 => Some(111), // F12
+        0x4a => Some(115), // Home
+        0x4b => Some(116), // Page up
+        0x4c => Some(117), // Forward delete
+        0x4d => Some(119), // End
+        0x4e => Some(121), // Page down
+        0x4f => Some(124), // Right
+        0x50 => Some(123), // Left
+        0x51 => Some(125), // Down
+        0x52 => Some(126), // Up
+        _ => None,
     }
 }
 

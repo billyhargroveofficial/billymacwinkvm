@@ -889,6 +889,7 @@ fn position_mac_cursor(x_ratio: Option<f64>, y_ratio: Option<f64>) {
     );
     let started = Instant::now();
     unsafe { CGWarpMouseCursorPosition(CGPoint { x, y }) };
+    crate::hid::cgevent_note_cursor_position(x, y);
     let elapsed = started.elapsed();
     if latency::report(elapsed) {
         info!(
