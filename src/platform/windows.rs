@@ -2,8 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::net::UdpSocket as StdUdpSocket;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -32,8 +33,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_RSHIFT, VK_RWIN, VK_SCROLL, VK_SHIFT, VK_SNAPSHOT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Input::{
-    GetRawInputData, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT,
-    RIDEV_DEVNOTIFY, RIDEV_INPUTSINK, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE, RegisterRawInputDevices,
+    GetRawInputBuffer, GetRawInputData, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
+    RID_INPUT, RIDEV_DEVNOTIFY, RIDEV_INPUTSINK, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
+    RegisterRawInputDevices,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, ClipCursor, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
@@ -61,6 +63,7 @@ const EDGE_TRIGGER_PX: i32 = 8;
 const EDGE_REARM_PX: i32 = 64;
 const HOTKEY_DEBOUNCE_MS: u64 = 250;
 const MOUSE_FLUSH_INTERVAL_MS: u64 = 4;
+const UDP_MOTION_SENDER_FLUSH_INTERVAL_MS: u64 = 1;
 const MAX_MOTION_DRAIN_PER_TURN: usize = 64;
 const MAX_MOTION_DELTA_PER_FLUSH: i32 = 512;
 const MAC_ENTRY_X_RATIO_FROM_WINDOWS: f64 = 1.0;
@@ -558,7 +561,7 @@ impl MotionTransport {
     async fn send_motion(&mut self, dx: i32, dy: i32) -> Result<bool> {
         match self {
             Self::Udp { writer } if writer.confirmed() => {
-                writer.send_motion(dx, dy, "writer")?;
+                writer.queue_motion(dx, dy);
                 Ok(true)
             }
             Self::Udp { writer } => {
@@ -603,15 +606,21 @@ struct SharedUdpMotionWriter {
     socket: Arc<StdUdpSocket>,
     seq: Arc<AtomicU64>,
     confirmed: Arc<AtomicBool>,
+    pending_dx: Arc<AtomicI32>,
+    pending_dy: Arc<AtomicI32>,
 }
 
 impl SharedUdpMotionWriter {
     fn new(socket: StdUdpSocket) -> Self {
-        Self {
+        let writer = Self {
             socket: Arc::new(socket),
             seq: Arc::new(AtomicU64::new(1)),
             confirmed: Arc::new(AtomicBool::new(false)),
-        }
+            pending_dx: Arc::new(AtomicI32::new(0)),
+            pending_dy: Arc::new(AtomicI32::new(0)),
+        };
+        writer.spawn_motion_sender();
+        writer
     }
 
     fn confirmed(&self) -> bool {
@@ -626,11 +635,24 @@ impl SharedUdpMotionWriter {
         if !self.confirmed() {
             return Ok(false);
         }
-        self.send_motion(dx, dy, path)?;
+        if path == "direct" || path == "writer" {
+            self.queue_motion(dx, dy);
+        } else {
+            self.send_motion(dx, dy, path)?;
+        }
         Ok(true)
     }
 
+    fn queue_motion(&self, dx: i32, dy: i32) {
+        accumulate_i32(&self.pending_dx, dx);
+        accumulate_i32(&self.pending_dy, dy);
+    }
+
     fn send_motion(&self, dx: i32, dy: i32, path: &'static str) -> Result<()> {
+        self.send_motion_immediate(dx, dy, path)
+    }
+
+    fn send_motion_immediate(&self, dx: i32, dy: i32, path: &'static str) -> Result<()> {
         let packet = MotionDatagram {
             seq: self.seq.fetch_add(1, Ordering::Relaxed),
             dx: dx.clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH),
@@ -659,6 +681,42 @@ impl SharedUdpMotionWriter {
         }
         Ok(())
     }
+
+    fn spawn_motion_sender(&self) {
+        let writer = self.clone();
+        thread::Builder::new()
+            .name("softkvm-udp-motion-sender".to_owned())
+            .spawn(move || {
+                prepare_low_latency_thread("UDP motion sender");
+                loop {
+                    thread::sleep(Duration::from_millis(UDP_MOTION_SENDER_FLUSH_INTERVAL_MS));
+                    if !writer.confirmed() {
+                        continue;
+                    }
+
+                    let dx = writer.pending_dx.swap(0, Ordering::AcqRel);
+                    let dy = writer.pending_dy.swap(0, Ordering::AcqRel);
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+
+                    if let Err(err) = writer.send_motion_immediate(dx, dy, "sender-thread") {
+                        warn!(?err, "udp motion sender thread failed to flush motion");
+                    }
+                }
+            })
+            .expect("spawn UDP motion sender thread");
+    }
+}
+
+fn accumulate_i32(cell: &AtomicI32, delta: i32) {
+    let _ = cell.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(
+            current
+                .saturating_add(delta)
+                .clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH),
+        )
+    });
 }
 
 async fn writer_task(
@@ -1178,7 +1236,12 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_INPUT => {
-            if let Err(err) = handle_raw_input(lparam) {
+            let result = if buffered_raw_input_enabled() {
+                handle_raw_input_buffered(lparam)
+            } else {
+                handle_raw_input(lparam)
+            };
+            if let Err(err) = result {
                 warn!(?err, "raw input failed");
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -1196,11 +1259,91 @@ unsafe extern "system" fn wnd_proc(
 
 fn handle_raw_input(lparam: LPARAM) -> Result<()> {
     let raw = unsafe { read_raw_input(lparam)? };
+    handle_raw_input_struct(raw)
+}
+
+fn handle_raw_input_struct(raw: RAWINPUT) -> Result<()> {
     match raw.header.dwType {
         t if t == RIM_TYPEMOUSE.0 => handle_mouse(raw),
         t if t == RIM_TYPEKEYBOARD.0 => handle_keyboard(raw),
         _ => Ok(()),
     }
+}
+
+fn handle_raw_input_buffered(lparam: LPARAM) -> Result<()> {
+    let started = Instant::now();
+    let mut buffer = vec![RAWINPUT::default(); 1024];
+    let mut total = 0_usize;
+
+    loop {
+        let mut buffer_size = (buffer.len() * size_of::<RAWINPUT>()) as u32;
+        let count = unsafe {
+            GetRawInputBuffer(
+                Some(buffer.as_mut_ptr()),
+                &mut buffer_size,
+                size_of::<RAWINPUTHEADER>() as u32,
+            )
+        };
+
+        if count == u32::MAX {
+            if total == 0 {
+                return handle_raw_input(lparam);
+            }
+            return Err(windows::core::Error::from_thread()).context("GetRawInputBuffer");
+        }
+
+        if count == 0 {
+            break;
+        }
+
+        unsafe {
+            handle_raw_input_buffer_entries(buffer.as_ptr(), count)?;
+        }
+        total += count as usize;
+
+        if count < buffer.len() as u32 {
+            break;
+        }
+    }
+
+    if total == 0 {
+        handle_raw_input(lparam)?;
+    }
+
+    let elapsed = started.elapsed();
+    if total > 1 || latency::report(elapsed) {
+        info!(
+            target: "softkvm::latency",
+            packets = total,
+            elapsed_ms = latency::ms(elapsed),
+            "windows buffered raw input drain"
+        );
+    }
+
+    Ok(())
+}
+
+unsafe fn handle_raw_input_buffer_entries(base: *const RAWINPUT, count: u32) -> Result<()> {
+    let mut current = base;
+    for _ in 0..count {
+        let raw_ref = unsafe { &*current };
+        let step = raw_ref
+            .header
+            .dwSize
+            .max(size_of::<RAWINPUTHEADER>() as u32) as usize;
+        let raw = unsafe { std::ptr::read_unaligned(current) };
+        handle_raw_input_struct(raw)?;
+        current = unsafe { current.cast::<u8>().add(step).cast::<RAWINPUT>() };
+    }
+    Ok(())
+}
+
+fn buffered_raw_input_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("SOFTKVM_RAW_INPUT_READER")
+            .is_ok_and(|value| value.eq_ignore_ascii_case("lparam"))
+    })
 }
 
 unsafe fn read_raw_input(lparam: LPARAM) -> Result<RAWINPUT> {
