@@ -7,6 +7,8 @@ use std::collections::HashSet;
 #[cfg(unix)]
 use std::sync::Arc;
 #[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -124,6 +126,7 @@ impl KarabinerSink {
         let mut client = KarabinerClient::connect(KARABINER_SOCKET).await?;
         client.initialize_keyboard().await?;
         client.initialize_pointing().await?;
+        client.wait_ready().await?;
         Ok(Self {
             client,
             buttons: 0,
@@ -268,7 +271,15 @@ fn take_i8_chunk(value: &mut i32) -> i8 {
 #[cfg(unix)]
 struct KarabinerClient {
     writer: Arc<AsyncMutex<OwnedWriteHalf>>,
+    status: Arc<KarabinerStatus>,
     next_request_id: u64,
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct KarabinerStatus {
+    keyboard_ready: AtomicBool,
+    pointing_ready: AtomicBool,
 }
 
 #[cfg(unix)]
@@ -279,10 +290,16 @@ impl KarabinerClient {
             .with_context(|| format!("connect Karabiner socket {path}"))?;
         let (reader, writer) = stream.into_split();
         let writer = Arc::new(AsyncMutex::new(writer));
-        tokio::spawn(karabiner_reader_task(reader, writer.clone()));
+        let status = Arc::new(KarabinerStatus::default());
+        tokio::spawn(karabiner_reader_task(
+            reader,
+            writer.clone(),
+            status.clone(),
+        ));
         tokio::spawn(karabiner_heartbeat_task(writer.clone()));
         Ok(Self {
             writer,
+            status,
             next_request_id: 1,
         })
     }
@@ -299,6 +316,31 @@ impl KarabinerClient {
     async fn initialize_pointing(&mut self) -> Result<()> {
         self.request(KarabinerRequest::VirtualHidPointingInitialize, &[])
             .await
+    }
+
+    async fn wait_ready(&mut self) -> Result<()> {
+        for _ in 0..40 {
+            self.get_status().await?;
+            sleep(Duration::from_millis(50)).await;
+
+            if self.status.keyboard_ready.load(Ordering::Relaxed)
+                && self.status.pointing_ready.load(Ordering::Relaxed)
+            {
+                info!("Karabiner VirtualHID reports keyboard and pointing ready");
+                return Ok(());
+            }
+        }
+
+        warn!(
+            keyboard_ready = self.status.keyboard_ready.load(Ordering::Relaxed),
+            pointing_ready = self.status.pointing_ready.load(Ordering::Relaxed),
+            "Karabiner VirtualHID did not report full readiness before timeout"
+        );
+        Ok(())
+    }
+
+    async fn get_status(&mut self) -> Result<()> {
+        self.request(KarabinerRequest::GetStatus, &[]).await
     }
 
     async fn post_keyboard(&mut self, modifiers: u8, keys: &[u16; 32]) -> Result<()> {
@@ -365,7 +407,11 @@ async fn karabiner_heartbeat_task(writer: Arc<AsyncMutex<OwnedWriteHalf>>) {
 }
 
 #[cfg(unix)]
-async fn karabiner_reader_task(mut reader: OwnedReadHalf, writer: Arc<AsyncMutex<OwnedWriteHalf>>) {
+async fn karabiner_reader_task(
+    mut reader: OwnedReadHalf,
+    writer: Arc<AsyncMutex<OwnedWriteHalf>>,
+    status: Arc<KarabinerStatus>,
+) {
     loop {
         let body = match read_karabiner_body(&mut reader).await {
             Ok(body) => body,
@@ -387,11 +433,48 @@ async fn karabiner_reader_task(mut reader: OwnedReadHalf, writer: Arc<AsyncMutex
                 }
             }
             5 => {
-                // response; requests are pipelined so input events do not wait on this path.
+                handle_karabiner_response(&body, &status);
             }
             _ => {
                 // Ignore unrelated protocol frames.
             }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn handle_karabiner_response(body: &[u8], status: &KarabinerStatus) {
+    const RESPONSE_HEADER_LEN: usize = 1 + 8;
+
+    if body.len() < RESPONSE_HEADER_LEN {
+        warn!(len = body.len(), "short Karabiner response");
+        return;
+    }
+
+    let payload = &body[RESPONSE_HEADER_LEN..];
+    if payload.len() % 2 != 0 {
+        warn!(
+            len = payload.len(),
+            "invalid Karabiner status response payload"
+        );
+        return;
+    }
+
+    for pair in payload.chunks_exact(2) {
+        let response_type = pair[0];
+        let ready = pair[1] != 0;
+        match response_type {
+            4 => {
+                if status.keyboard_ready.swap(ready, Ordering::Relaxed) != ready {
+                    info!(ready, "Karabiner virtual keyboard readiness changed");
+                }
+            }
+            5 => {
+                if status.pointing_ready.swap(ready, Ordering::Relaxed) != ready {
+                    info!(ready, "Karabiner virtual pointing readiness changed");
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -439,6 +522,7 @@ where
 #[cfg(unix)]
 #[derive(Clone, Copy)]
 enum KarabinerRequest {
+    GetStatus = 0,
     VirtualHidKeyboardInitialize = 1,
     VirtualHidPointingInitialize = 4,
     PostKeyboardInputReport = 7,

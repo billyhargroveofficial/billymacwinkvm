@@ -71,17 +71,21 @@ async fn mac_hid_smoke() -> Result<()> {
 
 async fn mac_key_smoke() -> Result<()> {
     let mut sink = hid::karabiner_sink_async().await?;
-    sink.apply(InputEvent::Key {
-        key: KeyCode::Usb(0x04),
-        state: KeyState::Down,
-    })
-    .await?;
-    sleep(Duration::from_millis(30)).await;
-    sink.apply(InputEvent::Key {
-        key: KeyCode::Usb(0x04),
-        state: KeyState::Up,
-    })
-    .await?;
+    info!("typing five synthetic 'a' key presses through Karabiner VirtualHID");
+    for _ in 0..5 {
+        sink.apply(InputEvent::Key {
+            key: KeyCode::Usb(0x04),
+            state: KeyState::Down,
+        })
+        .await?;
+        sleep(Duration::from_millis(90)).await;
+        sink.apply(InputEvent::Key {
+            key: KeyCode::Usb(0x04),
+            state: KeyState::Up,
+        })
+        .await?;
+        sleep(Duration::from_millis(70)).await;
+    }
     sink.reset().await?;
     Ok(())
 }
