@@ -41,6 +41,8 @@ cd /Users/billy/repos/billymacwinkvm
 ./scripts/mac-log-client.sh
 ```
 
+That receiver only prints events. It does not move the Mac pointer.
+
 On the real Windows host, first run the preflight:
 
 ```powershell
@@ -56,6 +58,15 @@ Expected Mac log:
 
 Then run the real host:
 
+On the Mac, switch from the log receiver to the real Karabiner receiver:
+
+```bash
+cd /Users/billy/repos/billymacwinkvm
+./scripts/mac-karabiner-client.sh
+```
+
+On Windows:
+
 ```powershell
 .\scripts\windows-real-preflight.ps1 -Exe .\softkvm.exe -Peer <mac-lan-ip>:49321 -RunHost
 ```
@@ -68,6 +79,7 @@ Expected Mac log:
 Manual input check:
 
 - Press `Ctrl+Alt+\` to toggle remote mode.
+- If `Ctrl+Alt+\` does not fire on the current keyboard layout, press `Ctrl+Alt+F12`.
 - Or push the pointer into the Windows left edge with `--layout mac-left`.
 - Move the mouse and press harmless keys while watching the Mac log receiver.
 

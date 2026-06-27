@@ -8,4 +8,6 @@ SINK="${SOFTKVM_SINK:-log}"
 cd "$ROOT"
 
 cargo build
+echo "Starting log-only receiver. This prints events but does not move the Mac pointer."
+echo "For real macOS input, use ./scripts/mac-karabiner-client.sh"
 RUST_LOG="${RUST_LOG:-info}" target/debug/softkvm client --listen "0.0.0.0:$PORT" --sink "$SINK"

@@ -87,6 +87,9 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
                 Message::Hello(hello) => {
                     info!(?hello, "host hello");
                 }
+                Message::HostState(state) => {
+                    info!(?state, "host state");
+                }
                 Message::Input(event) => {
                     sink.apply(event).await?;
                 }

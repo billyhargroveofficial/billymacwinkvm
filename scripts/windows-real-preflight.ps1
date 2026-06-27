@@ -11,6 +11,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+$env:RUST_LOG = if ($env:RUST_LOG) { $env:RUST_LOG } else { "info" }
 
 if (!(Test-Path $Exe)) {
   throw "softkvm executable not found: $Exe"
@@ -47,7 +48,7 @@ Write-Host "== Synthetic probe =="
 Write-Host ""
 if ($RunHost) {
   Write-Host "== Real host =="
-  Write-Host "Press Ctrl+C here to stop. Toggle remote mode with Ctrl+Alt+\\."
+  Write-Host "Press Ctrl+C here to stop. Toggle remote mode with Ctrl+Alt+\ or Ctrl+Alt+F12."
   & $Exe host --peer $Peer --layout $Layout
 } else {
   Write-Host "PASS: preflight probe reached Mac."

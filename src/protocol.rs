@@ -24,6 +24,7 @@ impl Frame {
 pub enum Message {
     Hello(ProtocolHello),
     Heartbeat { monotonic_ms: u64 },
+    HostState(HostStateEvent),
     Input(InputEvent),
     InputReset,
 }
@@ -33,6 +34,12 @@ pub struct ProtocolHello {
     pub protocol_version: u16,
     pub role: String,
     pub device_name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct HostStateEvent {
+    pub remote_active: bool,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -46,6 +46,7 @@ cargo run -- probe --peer 127.0.0.1:49321
 ./scripts/parallels-host-smoke.sh
 ./scripts/test-parallels.sh
 ./scripts/mac-log-client.sh
+./scripts/mac-karabiner-client.sh
 ```
 
 Real Windows preflight:

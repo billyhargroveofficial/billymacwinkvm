@@ -12,8 +12,8 @@ use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VK_CONTROL, VK_ESCAPE,
-    VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_OEM_5, VK_RCONTROL, VK_RETURN, VK_RMENU,
-    VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB,
+    VK_F12, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_OEM_5, VK_RCONTROL, VK_RETURN,
+    VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB,
 };
 use windows::Win32::UI::Input::{
     GetRawInputData, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT,
@@ -31,11 +31,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::w;
 
 use crate::protocol::{
-    Frame, InputEvent, KeyCode, KeyState, Message, Modifier, MouseButton, ProtocolHello,
+    Frame, HostStateEvent, InputEvent, KeyCode, KeyState, Message, Modifier, MouseButton,
+    ProtocolHello,
 };
 use crate::transport::FrameWriter;
 
-const HOTKEY_ID_TOGGLE: i32 = 1;
+const HOTKEY_ID_TOGGLE_BACKSLASH: i32 = 1;
+const HOTKEY_ID_TOGGLE_F12: i32 = 2;
 const WHEEL_DELTA: i32 = 120;
 
 static HOST_STATE: OnceLock<Mutex<HostState>> = OnceLock::new();
@@ -86,6 +88,10 @@ async fn writer_task(stream: TcpStream, mut rx: mpsc::UnboundedReceiver<HostComm
 
     while let Some(command) = rx.recv().await {
         let message = match command {
+            HostCommand::HostState { active, reason } => Message::HostState(HostStateEvent {
+                remote_active: active,
+                reason: reason.to_owned(),
+            }),
             HostCommand::Input(event) => Message::Input(event),
             HostCommand::Reset => Message::InputReset,
         };
@@ -120,7 +126,7 @@ fn run_message_loop() -> Result<()> {
         if result.0 == -1 {
             unsafe {
                 release_remote_controls();
-                let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID_TOGGLE);
+                unregister_hotkeys(hwnd);
                 let _ = DestroyWindow(hwnd);
             }
             bail!("GetMessageW failed");
@@ -137,7 +143,7 @@ fn run_message_loop() -> Result<()> {
 
     unsafe {
         release_remote_controls();
-        let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID_TOGGLE);
+        unregister_hotkeys(hwnd);
         let _ = DestroyWindow(hwnd);
     }
     Ok(())
@@ -206,12 +212,24 @@ unsafe fn register_hotkey(hwnd: HWND) -> Result<()> {
     unsafe {
         RegisterHotKey(
             Some(hwnd),
-            HOTKEY_ID_TOGGLE,
+            HOTKEY_ID_TOGGLE_BACKSLASH,
             modifiers,
             u32::from(VK_OEM_5.0),
         )
-        .context("RegisterHotKey Ctrl+Alt+\\")
+        .context("RegisterHotKey Ctrl+Alt+\\")?;
+        RegisterHotKey(
+            Some(hwnd),
+            HOTKEY_ID_TOGGLE_F12,
+            modifiers,
+            u32::from(VK_F12.0),
+        )
+        .context("RegisterHotKey Ctrl+Alt+F12")
     }
+}
+
+unsafe fn unregister_hotkeys(hwnd: HWND) {
+    let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_ID_TOGGLE_BACKSLASH) };
+    let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_ID_TOGGLE_F12) };
 }
 
 unsafe extern "system" fn wnd_proc(
@@ -221,8 +239,18 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
-        WM_HOTKEY if wparam.0 as i32 == HOTKEY_ID_TOGGLE => {
-            if let Err(err) = toggle_remote("hotkey") {
+        WM_HOTKEY
+            if matches!(
+                wparam.0 as i32,
+                HOTKEY_ID_TOGGLE_BACKSLASH | HOTKEY_ID_TOGGLE_F12
+            ) =>
+        {
+            let reason = if wparam.0 as i32 == HOTKEY_ID_TOGGLE_F12 {
+                "hotkey Ctrl+Alt+F12"
+            } else {
+                "hotkey Ctrl+Alt+\\"
+            };
+            if let Err(err) = toggle_remote(reason) {
                 error!(?err, "toggle failed");
             }
             LRESULT(0)
@@ -406,6 +434,7 @@ fn lock_state() -> Result<std::sync::MutexGuard<'static, HostState>> {
 
 #[derive(Clone, Debug)]
 enum HostCommand {
+    HostState { active: bool, reason: &'static str },
     Input(InputEvent),
     Reset,
 }
@@ -440,9 +469,11 @@ impl HostState {
 
         if active {
             unsafe { clip_cursor_to_left_edge()? };
+            self.send(HostCommand::HostState { active, reason })?;
             info!(reason, "remote macOS control enabled");
         } else {
             unsafe { release_remote_controls() };
+            self.send(HostCommand::HostState { active, reason })?;
             self.send(HostCommand::Reset)?;
             info!(reason, "remote macOS control disabled");
         }
