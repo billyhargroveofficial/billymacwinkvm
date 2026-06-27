@@ -16,6 +16,9 @@ pub enum Command {
     /// Check whether Karabiner VirtualHID is present on macOS.
     MacHidProbe,
 
+    /// Send a tiny no-click movement through Karabiner VirtualHID.
+    MacHidSmoke,
+
     /// Run the controlled machine receiver.
     Client {
         #[arg(long, default_value = "0.0.0.0:49321")]

@@ -25,6 +25,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::GenPsk => gen_psk(),
         Command::MacHidProbe => mac_hid_probe(),
+        Command::MacHidSmoke => mac_hid_smoke().await,
         Command::Client { listen, sink } => run_client(listen, sink).await,
         Command::Probe { peer } => run_probe(peer).await,
         Command::Host { peer, layout } => run_host(peer, layout).await,
@@ -47,6 +48,21 @@ fn mac_hid_probe() -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+async fn mac_hid_smoke() -> Result<()> {
+    let mut sink = hid::karabiner_sink_async().await?;
+    for _ in 0..30 {
+        sink.apply(InputEvent::MouseMotion { dx: 8, dy: 0 }).await?;
+        sleep(Duration::from_millis(5)).await;
+    }
+    for _ in 0..30 {
+        sink.apply(InputEvent::MouseMotion { dx: -8, dy: 0 })
+            .await?;
+        sleep(Duration::from_millis(5)).await;
+    }
+    sink.reset().await?;
     Ok(())
 }
 
