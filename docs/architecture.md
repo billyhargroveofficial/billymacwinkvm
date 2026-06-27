@@ -12,7 +12,7 @@ Hard requirements:
 
 - Edge transfer from Windows left edge into macOS, and macOS right edge back to Windows.
 - Toggle/escape hotkey: `Ctrl+Alt+\`.
-- While controlling macOS, map Windows `Alt` to macOS `Command` and Windows `Super/Win` to macOS `Option`.
+- Default macOS modifier profile maps Windows `Super/Win` to macOS `Command` and Windows `Alt` to macOS `Option`; `SOFTKVM_MAC_MODIFIER_POLICY=swap-alt-super` enables the PC physical-order profile.
 - The macOS side should use a virtual HID mouse/keyboard so device-tuning tools such as LinearMouse and Scroll Reverser can see it.
 - Reliable reconnect after sleep/wake.
 - Startup at login.
@@ -76,7 +76,8 @@ not baked into raw capture.
 
 For macOS target profile:
 
-- Windows `Alt` -> macOS `Command`
-- Windows `Super/Win` -> macOS `Option`
+- Default: Windows `Super/Win` -> macOS `Command`
+- Default: Windows `Alt` -> macOS `Option`
+- Optional `swap-alt-super`: Windows `Alt` -> macOS `Command`, Windows `Super/Win` -> macOS `Option`
 - Windows `Ctrl` -> macOS `Control`
 - Windows `Shift` -> macOS `Shift`

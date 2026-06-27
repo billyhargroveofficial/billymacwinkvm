@@ -10,6 +10,9 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey,
@@ -45,7 +48,7 @@ use crate::transport::FrameWriter;
 const HOTKEY_ID_TOGGLE_BACKSLASH: i32 = 1;
 const HOTKEY_ID_TOGGLE_NON_US_BACKSLASH: i32 = 2;
 const EDGE_TRIGGER_PX: i32 = 8;
-const MAX_MOUSE_COALESCE_EVENTS: usize = 4;
+const MAX_MOUSE_COALESCE_EVENTS: usize = 1;
 const MAX_MOUSE_COALESCE_DELTA: i32 = 96;
 const WHEEL_DELTA: i32 = 120;
 const SCANCODE_BACKSLASH: u32 = 0x2b;
@@ -110,6 +113,19 @@ async fn writer_task(stream: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Hos
             HostCommand::HostState { active, reason } => Message::HostState(HostStateEvent {
                 remote_active: active,
                 reason: reason.to_owned(),
+                entry_x_ratio: None,
+                entry_y_ratio: None,
+            }),
+            HostCommand::HostStateWithEntry {
+                active,
+                reason,
+                entry_x_ratio,
+                entry_y_ratio,
+            } => Message::HostState(HostStateEvent {
+                remote_active: active,
+                reason: reason.to_owned(),
+                entry_x_ratio: Some(entry_x_ratio),
+                entry_y_ratio: Some(entry_y_ratio),
             }),
             HostCommand::Input(event) => Message::Input(event),
             HostCommand::Reset => Message::InputReset,
@@ -120,6 +136,7 @@ async fn writer_task(stream: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Hos
             .await
         {
             error!(?err, "host writer disconnected");
+            release_host_state_after_transport_loss("writer disconnected");
             break;
         }
         seq += 1;
@@ -188,20 +205,32 @@ async fn control_reader_task(stream: OwnedReadHalf) {
             Ok(Some(frame)) => frame,
             Ok(None) => {
                 warn!("host control reader disconnected");
+                release_host_state_after_transport_loss("control reader disconnected");
                 break;
             }
             Err(err) => {
                 warn!(?err, "host control reader failed");
+                release_host_state_after_transport_loss("control reader failed");
                 break;
             }
         };
 
-        if let Message::ClientControl(ClientControlEvent::ReleaseHost { reason }) = frame.message {
+        if let Message::ClientControl(ClientControlEvent::ReleaseHost {
+            reason,
+            entry_x_ratio,
+            entry_y_ratio,
+        }) = frame.message
+        {
             info!(%reason, "client requested host release");
             match lock_state() {
                 Ok(mut state) => {
                     if state.remote_active
-                        && let Err(err) = state.set_remote_active(false, "mac right edge")
+                        && let Err(err) = state.set_remote_active(
+                            false,
+                            "mac right edge",
+                            entry_x_ratio,
+                            entry_y_ratio,
+                        )
                     {
                         warn!(?err, "failed to release host from client control");
                     }
@@ -448,7 +477,8 @@ fn handle_mouse(raw: RAWINPUT) -> Result<()> {
         && mouse.lLastX < 0
         && cursor_at_left_edge()
     {
-        state.set_remote_active(true, "left edge")?;
+        let (_, y_ratio) = current_monitor_cursor_ratios().unwrap_or((0.98, 0.5));
+        state.set_remote_active(true, "left edge", Some(0.98), Some(y_ratio))?;
     }
 
     if state.remote_active {
@@ -509,7 +539,7 @@ fn handle_keyboard(raw: RAWINPUT) -> Result<()> {
 fn toggle_remote(reason: &'static str) -> Result<()> {
     let mut state = lock_state()?;
     let active = !state.remote_active;
-    state.set_remote_active(active, reason)
+    state.set_remote_active(active, reason, Some(0.5), Some(0.5))
 }
 
 fn cursor_at_left_edge() -> bool {
@@ -522,6 +552,40 @@ fn cursor_at_left_edge() -> bool {
     }
 }
 
+fn current_monitor_cursor_ratios() -> Option<(f64, f64)> {
+    let point = current_cursor_position().ok()?;
+    let rect = monitor_rect_for_point(point)?;
+    let width = (rect.right - rect.left).max(1) as f64;
+    let height = (rect.bottom - rect.top).max(1) as f64;
+    let x = ((point.x - rect.left) as f64 / width).clamp(0.0, 1.0);
+    let y = ((point.y - rect.top) as f64 / height).clamp(0.0, 1.0);
+    Some((x, y))
+}
+
+fn monitor_rect_for_point(point: POINT) -> Option<RECT> {
+    let monitor = unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return None;
+    }
+    Some(info.rcMonitor)
+}
+
+fn point_from_rect_ratios(rect: RECT, x_ratio: f64, y_ratio: f64) -> POINT {
+    let inset = 16.0;
+    let width = (rect.right - rect.left).max(1) as f64;
+    let height = (rect.bottom - rect.top).max(1) as f64;
+    POINT {
+        x: (rect.left as f64 + (width - inset * 2.0) * x_ratio.clamp(0.0, 1.0) + inset).round()
+            as i32,
+        y: (rect.top as f64 + (height - inset * 2.0) * y_ratio.clamp(0.0, 1.0) + inset).round()
+            as i32,
+    }
+}
+
 unsafe fn release_remote_controls() {
     let _ = unsafe { ClipCursor(None) };
 }
@@ -530,13 +594,31 @@ unsafe fn cleanup_host_state() {
     if let Some(state) = HOST_STATE.get()
         && let Ok(mut state) = state.lock()
     {
-        state.release_local_controls(true);
+        state.release_local_controls(true, None, None);
         state.remote_active = false;
         return;
     }
 
     unsafe {
         release_remote_controls();
+    }
+}
+
+fn release_host_state_after_transport_loss(reason: &'static str) {
+    match lock_state() {
+        Ok(mut state) => {
+            if state.remote_active {
+                warn!(reason, "transport lost; releasing local Windows controls");
+            }
+            state.remote_active = false;
+            state.pressed_modifier_keys.clear();
+            state.active_modifiers.clear();
+            state.release_local_controls(true, None, None);
+        }
+        Err(err) => warn!(
+            ?err,
+            reason, "failed to release local controls after transport loss"
+        ),
     }
 }
 
@@ -558,15 +640,15 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
             let key = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
 
             if key_down_message {
-                let ctrl_alt = ctrl_alt_down();
-                if remote_is_active() && ctrl_alt {
+                let ctrl_toggle = ctrl_toggle_modifier_down();
+                if remote_is_active() && ctrl_toggle {
                     info!(
                         vkey = key.vkCode,
                         scan_code = key.scanCode,
-                        "remote Ctrl+Alt keydown"
+                        "remote Ctrl+toggle-modifier keydown"
                     );
                 }
-                if is_backslash_key(key.vkCode as u16, key.scanCode) && ctrl_alt {
+                if is_backslash_key(key.vkCode as u16, key.scanCode) && ctrl_toggle {
                     if let Err(err) = toggle_remote("hotkey Ctrl+Alt+\\") {
                         error!(?err, "toggle failed");
                     }
@@ -626,9 +708,13 @@ fn remote_is_active() -> bool {
         .unwrap_or(false)
 }
 
-fn ctrl_alt_down() -> bool {
+fn ctrl_toggle_modifier_down() -> bool {
     (key_down(VK_CONTROL.0) || key_down(VK_LCONTROL.0) || key_down(VK_RCONTROL.0))
-        && (key_down(VK_MENU.0) || key_down(VK_LMENU.0) || key_down(VK_RMENU.0))
+        && (key_down(VK_MENU.0)
+            || key_down(VK_LMENU.0)
+            || key_down(VK_RMENU.0)
+            || key_down(VK_LWIN.0)
+            || key_down(VK_RWIN.0))
 }
 
 fn key_down(vkey: u16) -> bool {
@@ -652,7 +738,16 @@ fn lock_state() -> Result<std::sync::MutexGuard<'static, HostState>> {
 
 #[derive(Clone, Debug)]
 enum HostCommand {
-    HostState { active: bool, reason: &'static str },
+    HostState {
+        active: bool,
+        reason: &'static str,
+    },
+    HostStateWithEntry {
+        active: bool,
+        reason: &'static str,
+        entry_x_ratio: f64,
+        entry_y_ratio: f64,
+    },
     Input(InputEvent),
     Reset,
 }
@@ -666,6 +761,7 @@ struct HostState {
     mouse_hook: Option<isize>,
     keyboard_hook: Option<isize>,
     saved_cursor_pos: Option<POINT>,
+    saved_monitor_rect: Option<RECT>,
 }
 
 impl HostState {
@@ -679,10 +775,17 @@ impl HostState {
             mouse_hook: None,
             keyboard_hook: None,
             saved_cursor_pos: None,
+            saved_monitor_rect: None,
         }
     }
 
-    fn set_remote_active(&mut self, active: bool, reason: &'static str) -> Result<()> {
+    fn set_remote_active(
+        &mut self,
+        active: bool,
+        reason: &'static str,
+        entry_x_ratio: Option<f64>,
+        entry_y_ratio: Option<f64>,
+    ) -> Result<()> {
         if self.remote_active == active {
             return Ok(());
         }
@@ -693,11 +796,21 @@ impl HostState {
         if active {
             self.capture_local_controls()?;
             self.remote_active = true;
-            self.send(HostCommand::HostState { active, reason })?;
+            match entry_x_ratio.zip(entry_y_ratio) {
+                Some((entry_x_ratio, entry_y_ratio)) => {
+                    self.send(HostCommand::HostStateWithEntry {
+                        active,
+                        reason,
+                        entry_x_ratio,
+                        entry_y_ratio,
+                    })?;
+                }
+                None => self.send(HostCommand::HostState { active, reason })?,
+            }
             info!(reason, "remote macOS control enabled");
         } else {
             self.remote_active = false;
-            self.release_local_controls(true);
+            self.release_local_controls(true, entry_x_ratio, entry_y_ratio);
             self.send(HostCommand::HostState { active, reason })?;
             self.send(HostCommand::Reset)?;
             info!(reason, "remote macOS control disabled");
@@ -759,6 +872,7 @@ impl HostState {
             y: unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) },
         });
         self.saved_cursor_pos = Some(cursor);
+        self.saved_monitor_rect = monitor_rect_for_point(cursor);
         self.install_hooks()?;
         unsafe {
             clip_cursor_to_point(cursor)?;
@@ -767,18 +881,33 @@ impl HostState {
         Ok(())
     }
 
-    fn release_local_controls(&mut self, restore_cursor: bool) {
+    fn release_local_controls(
+        &mut self,
+        restore_cursor: bool,
+        entry_x_ratio: Option<f64>,
+        entry_y_ratio: Option<f64>,
+    ) {
         unsafe {
             release_remote_controls();
         }
         self.uninstall_hooks();
 
-        if restore_cursor
-            && let Some(cursor) = self.saved_cursor_pos.take()
-            && let Err(err) = unsafe { SetCursorPos(cursor.x, cursor.y) }
-        {
-            warn!(?err, "failed to restore Windows cursor position");
+        if restore_cursor {
+            let target = match (self.saved_monitor_rect, entry_x_ratio.zip(entry_y_ratio)) {
+                (Some(rect), Some((x_ratio, y_ratio))) => {
+                    Some(point_from_rect_ratios(rect, x_ratio, y_ratio))
+                }
+                _ => self.saved_cursor_pos,
+            };
+
+            if let Some(cursor) = target
+                && let Err(err) = unsafe { SetCursorPos(cursor.x, cursor.y) }
+            {
+                warn!(?err, "failed to restore Windows cursor position");
+            }
         }
+        self.saved_cursor_pos = None;
+        self.saved_monitor_rect = None;
     }
 
     fn install_hooks(&mut self) -> Result<()> {

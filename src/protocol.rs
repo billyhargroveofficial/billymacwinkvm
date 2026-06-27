@@ -41,11 +41,21 @@ pub struct ProtocolHello {
 pub struct HostStateEvent {
     pub remote_active: bool,
     pub reason: String,
+    #[serde(default)]
+    pub entry_x_ratio: Option<f64>,
+    #[serde(default)]
+    pub entry_y_ratio: Option<f64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ClientControlEvent {
-    ReleaseHost { reason: String },
+    ReleaseHost {
+        reason: String,
+        #[serde(default)]
+        entry_x_ratio: Option<f64>,
+        #[serde(default)]
+        entry_y_ratio: Option<f64>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -109,14 +119,24 @@ pub enum KeyCode {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(windows, allow(dead_code))]
 pub enum MacModifierPolicy {
-    /// Windows-like muscle memory for remote Mac: Alt -> Command, Super -> Option.
+    /// PC-keyboard physical order: Alt -> Command, Super -> Option.
     SwapAltSuper,
-    /// Raw platform-ish mapping: Super -> Command, Alt -> Option.
+    /// Semantic mapping for Mac-like labels: Super -> Command, Alt -> Option.
     Native,
 }
 
 #[cfg_attr(windows, allow(dead_code))]
 impl MacModifierPolicy {
+    pub fn from_env() -> Self {
+        match std::env::var("SOFTKVM_MAC_MODIFIER_POLICY") {
+            Ok(value) if matches!(value.as_str(), "swap" | "swap-alt-super" | "pc") => {
+                Self::SwapAltSuper
+            }
+            Ok(value) if matches!(value.as_str(), "native" | "mac" | "semantic") => Self::Native,
+            _ => Self::Native,
+        }
+    }
+
     pub fn map(self, modifier: Modifier) -> MacModifier {
         match (self, modifier) {
             (Self::SwapAltSuper, Modifier::Alt) => MacModifier::Command,
@@ -150,6 +170,18 @@ mod tests {
         );
         assert_eq!(
             MacModifierPolicy::SwapAltSuper.map(Modifier::Super),
+            MacModifier::Option
+        );
+    }
+
+    #[test]
+    fn native_policy_matches_mac_semantics() {
+        assert_eq!(
+            MacModifierPolicy::Native.map(Modifier::Super),
+            MacModifier::Command
+        );
+        assert_eq!(
+            MacModifierPolicy::Native.map(Modifier::Alt),
             MacModifier::Option
         );
     }

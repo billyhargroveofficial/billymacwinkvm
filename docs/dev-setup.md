@@ -61,10 +61,11 @@ Current host MVP:
 - Captures mouse and keyboard through Raw Input.
 - `Ctrl+Alt+\` toggles remote macOS control.
 - With `--layout mac-left`, pushing left at the Windows virtual-screen edge enables remote control.
-- Clips the Windows cursor to the left edge while remote control is active.
+- Parks/clips the Windows cursor while remote control is active.
+- Suppresses local Windows mouse/keyboard input while remote control is active.
+- Restores cursor position by monitor-relative height when crossing back.
 
 Not implemented yet:
 
-- Low-level hook suppression, so local Windows apps can still see input while the MVP is active.
 - Wake/reconnect policy.
 - QUIC/datagram transport.

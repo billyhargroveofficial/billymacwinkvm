@@ -127,12 +127,14 @@ impl KarabinerSink {
         client.initialize_keyboard().await?;
         client.initialize_pointing().await?;
         client.wait_ready().await?;
+        let modifier_policy = MacModifierPolicy::from_env();
+        info!(?modifier_policy, "using macOS modifier policy");
         Ok(Self {
             client,
             buttons: 0,
             modifiers: 0,
             keys: HashSet::new(),
-            modifier_policy: MacModifierPolicy::SwapAltSuper,
+            modifier_policy,
         })
     }
 

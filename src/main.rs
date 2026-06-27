@@ -9,8 +9,10 @@ use clap::Parser;
 use cli::{Cli, Command, SinkKind};
 use hid::{HidSink, KarabinerProbe, LogSink};
 use protocol::{
-    ClientControlEvent, Frame, InputEvent, KeyCode, KeyState, Message, MouseButton, ProtocolHello,
+    ClientControlEvent, Frame, InputEvent, KeyCode, KeyState, Message, Modifier, MouseButton,
+    ProtocolHello,
 };
+use std::collections::HashSet;
 use tokio::net::TcpStream;
 use tokio::time::{Duration, sleep};
 use tracing::{info, warn};
@@ -21,6 +23,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    install_signal_guards();
 
     let cli = Cli::parse();
 
@@ -123,15 +126,19 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
                 Message::HostState(state) => {
                     info!(?state, "host state");
                     client_state.remote_active = state.remote_active;
+                    client_state.reset_keys();
+                    if state.remote_active {
+                        position_mac_cursor(state.entry_x_ratio, state.entry_y_ratio);
+                    } else {
+                        reset_input(&mut hid_sink, sink).await;
+                    }
                 }
                 Message::ClientControl(control) => {
                     info!(?control, "client control from peer ignored");
                 }
                 Message::Input(event) => {
                     touched_input = true;
-                    let check_right_edge = client_state.should_check_right_edge_release(&event);
-                    apply_input(&mut hid_sink, sink, event).await;
-                    if check_right_edge && mac_cursor_at_right_edge() {
+                    if client_state.should_release_for_hotkey(&event) {
                         client_state.remote_active = false;
                         reset_input(&mut hid_sink, sink).await;
                         if let Err(err) = writer
@@ -139,7 +146,34 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
                                 client_session_id,
                                 client_seq,
                                 Message::ClientControl(ClientControlEvent::ReleaseHost {
+                                    reason: "remote hotkey Ctrl+Alt+\\".to_owned(),
+                                    entry_x_ratio: Some(0.5),
+                                    entry_y_ratio: Some(0.5),
+                                }),
+                            ))
+                            .await
+                        {
+                            warn!(?err, "failed to request host release from hotkey");
+                        } else {
+                            client_seq += 1;
+                            info!("requested Windows host release from remote hotkey");
+                        }
+                        continue;
+                    }
+                    let check_right_edge = client_state.should_check_right_edge_release(&event);
+                    apply_input(&mut hid_sink, sink, event).await;
+                    if check_right_edge && mac_cursor_at_right_edge() {
+                        client_state.remote_active = false;
+                        reset_input(&mut hid_sink, sink).await;
+                        let (_, y_ratio) = mac_cursor_ratios().unwrap_or((0.0, 0.5));
+                        if let Err(err) = writer
+                            .write_frame(Frame::new(
+                                client_session_id,
+                                client_seq,
+                                Message::ClientControl(ClientControlEvent::ReleaseHost {
                                     reason: "mac right edge".to_owned(),
+                                    entry_x_ratio: Some(0.02),
+                                    entry_y_ratio: Some(y_ratio),
                                 }),
                             ))
                             .await
@@ -153,6 +187,7 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
                 }
                 Message::InputReset => {
                     touched_input = true;
+                    client_state.reset_keys();
                     reset_input(&mut hid_sink, sink).await;
                 }
                 Message::Heartbeat { monotonic_ms } => {
@@ -176,9 +211,39 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
 #[derive(Default)]
 struct ClientRuntimeState {
     remote_active: bool,
+    active_modifiers: HashSet<Modifier>,
 }
 
 impl ClientRuntimeState {
+    fn reset_keys(&mut self) {
+        self.active_modifiers.clear();
+    }
+
+    fn should_release_for_hotkey(&mut self, event: &InputEvent) -> bool {
+        match event {
+            InputEvent::Modifier { modifier, state } => {
+                match state {
+                    KeyState::Down => {
+                        self.active_modifiers.insert(*modifier);
+                    }
+                    KeyState::Up => {
+                        self.active_modifiers.remove(modifier);
+                    }
+                }
+                false
+            }
+            InputEvent::Key {
+                key: KeyCode::Backslash,
+                state: KeyState::Down,
+            } if self.remote_active => {
+                self.active_modifiers.contains(&Modifier::Control)
+                    && (self.active_modifiers.contains(&Modifier::Alt)
+                        || self.active_modifiers.contains(&Modifier::Super))
+            }
+            _ => false,
+        }
+    }
+
     fn should_check_right_edge_release(&self, event: &InputEvent) -> bool {
         matches!(event, InputEvent::MouseMotion { dx, .. } if self.remote_active && *dx > 0)
     }
@@ -200,6 +265,34 @@ fn mac_cursor_at_right_edge() -> bool {
         None => false,
     }
 }
+
+#[cfg(target_os = "macos")]
+fn mac_cursor_ratios() -> Option<(f64, f64)> {
+    let (cursor, bounds) = unsafe { mac_cursor_and_main_display_bounds()? };
+    let x = ((cursor.x - bounds.origin.x) / bounds.size.width).clamp(0.0, 1.0);
+    let y = ((cursor.y - bounds.origin.y) / bounds.size.height).clamp(0.0, 1.0);
+    Some((x, y))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mac_cursor_ratios() -> Option<(f64, f64)> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn position_mac_cursor(x_ratio: Option<f64>, y_ratio: Option<f64>) {
+    let Some((x_ratio, y_ratio)) = x_ratio.zip(y_ratio) else {
+        return;
+    };
+    let bounds = unsafe { CGDisplayBounds(CGMainDisplayID()) };
+    let inset = 16.0;
+    let x = bounds.origin.x + (bounds.size.width - inset * 2.0) * x_ratio.clamp(0.0, 1.0) + inset;
+    let y = bounds.origin.y + (bounds.size.height - inset * 2.0) * y_ratio.clamp(0.0, 1.0) + inset;
+    unsafe { CGWarpMouseCursorPosition(CGPoint { x, y }) };
+}
+
+#[cfg(not(target_os = "macos"))]
+fn position_mac_cursor(_x_ratio: Option<f64>, _y_ratio: Option<f64>) {}
 
 #[cfg(not(target_os = "macos"))]
 fn mac_cursor_at_right_edge() -> bool {
@@ -237,6 +330,7 @@ unsafe extern "C" {
     fn CGDisplayBounds(display: u32) -> CGRect;
     fn CGEventCreate(source: *const std::ffi::c_void) -> *mut std::ffi::c_void;
     fn CGEventGetLocation(event: *mut std::ffi::c_void) -> CGPoint;
+    fn CGWarpMouseCursorPosition(new_cursor_position: CGPoint) -> i32;
     fn CFRelease(cf: *const std::ffi::c_void);
 }
 
@@ -365,3 +459,19 @@ fn hostname() -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "softkvm".to_owned())
 }
+
+#[cfg(unix)]
+fn install_signal_guards() {
+    tokio::spawn(async {
+        let Ok(mut sigquit) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::quit())
+        else {
+            return;
+        };
+        while sigquit.recv().await.is_some() {
+            warn!("ignored SIGQUIT; remote Ctrl+\\ should be handled as a KVM hotkey");
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn install_signal_guards() {}

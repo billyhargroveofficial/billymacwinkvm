@@ -82,5 +82,6 @@ Manual input check:
 - Or push the pointer into the Windows left edge with `--layout mac-left`.
 - Move the mouse and press harmless keys while watching the Mac log receiver.
 - On the Windows host log, keyboard forwarding should print `sending remote keyboard hook input`.
+- On the Mac log, startup should print `using macOS modifier policy modifier_policy=Native`.
 
 If keyboard events do not arrive on macOS, first check whether the Windows log shows `sending remote keyboard hook input`. If it does, debug the Mac receiver path; if it does not, debug the Windows hook path.

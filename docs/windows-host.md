@@ -60,14 +60,14 @@ RemoteActive:
 
 `Ctrl+Alt+\` is `MOD_CONTROL | MOD_ALT | MOD_NOREPEAT` with `VK_OEM_5` on common US-like layouts.
 
-While `RemoteActive`, the low-level keyboard hook must detect the chord and post a local toggle message. Do not let the chord leak to Windows apps or the Mac.
+While `RemoteActive`, the low-level keyboard hook detects `Ctrl+(Alt|Super)+\` and toggles locally. Do not let the chord leak to Windows apps or the Mac.
 
 ## Modifier Mapping
 
 When controlling macOS:
 
-- Windows `Alt` -> macOS `Command`
-- Windows `Super/Win` -> macOS `Option`
+- Default semantic profile: Windows `Super/Win` -> macOS `Command`, Windows `Alt` -> macOS `Option`
+- Optional PC physical-order profile via `SOFTKVM_MAC_MODIFIER_POLICY=swap-alt-super`: Windows `Alt` -> macOS `Command`, Windows `Super/Win` -> macOS `Option`
 - Windows `Ctrl` -> macOS `Control`
 - Windows `Shift` -> macOS `Shift`
 
