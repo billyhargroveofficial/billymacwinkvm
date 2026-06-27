@@ -77,6 +77,9 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
     loop {
         let (stream, addr) = listener.accept().await?;
         info!(%addr, "accepted host");
+        if let Err(err) = stream.set_nodelay(true) {
+            warn!(?err, "failed to set TCP_NODELAY on accepted host stream");
+        }
 
         let mut reader = transport::FrameReader::new(stream);
         let mut saw_frame = false;
@@ -162,6 +165,7 @@ async fn run_probe(peer: String) -> Result<()> {
     let stream = TcpStream::connect(&peer)
         .await
         .with_context(|| format!("connect {peer}"))?;
+    stream.set_nodelay(true).context("set TCP_NODELAY")?;
     let mut writer = transport::FrameWriter::new(stream);
     let session_id = Uuid::new_v4();
 

@@ -8,25 +8,27 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VK_CONTROL, VK_ESCAPE,
-    VK_F12, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_OEM_5, VK_RCONTROL, VK_RETURN,
-    VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB,
+    GetAsyncKeyState, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey,
+    VK_CONTROL, VK_ESCAPE, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_OEM_5,
+    VK_RCONTROL, VK_RETURN, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB,
 };
 use windows::Win32::UI::Input::{
     GetRawInputData, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT,
     RIDEV_DEVNOTIFY, RIDEV_INPUTSINK, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE, RegisterRawInputDevices,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    ClipCursor, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
-    GetMessageW, GetSystemMetrics, HWND_MESSAGE, MSG, PostQuitMessage, RI_KEY_BREAK,
-    RI_MOUSE_BUTTON_1_DOWN, RI_MOUSE_BUTTON_1_UP, RI_MOUSE_BUTTON_2_DOWN, RI_MOUSE_BUTTON_2_UP,
-    RI_MOUSE_BUTTON_3_DOWN, RI_MOUSE_BUTTON_3_UP, RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP,
-    RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP, RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL, RegisterClassW,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, TranslateMessage, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_DESTROY, WM_HOTKEY, WM_INPUT, WNDCLASSW,
+    CallNextHookEx, ClipCursor, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetCursorPos, GetMessageW, GetSystemMetrics, HC_ACTION, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT,
+    MSG, PostQuitMessage, RI_KEY_BREAK, RI_MOUSE_BUTTON_1_DOWN, RI_MOUSE_BUTTON_1_UP,
+    RI_MOUSE_BUTTON_2_DOWN, RI_MOUSE_BUTTON_2_UP, RI_MOUSE_BUTTON_3_DOWN, RI_MOUSE_BUTTON_3_UP,
+    RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP, RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP,
+    RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL, RegisterClassW, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SetCursorPos, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
+    WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY, WM_HOTKEY, WM_INPUT, WM_KEYDOWN,
+    WM_SYSKEYDOWN, WNDCLASSW,
 };
 use windows::core::w;
 
@@ -37,7 +39,7 @@ use crate::protocol::{
 use crate::transport::FrameWriter;
 
 const HOTKEY_ID_TOGGLE_BACKSLASH: i32 = 1;
-const HOTKEY_ID_TOGGLE_F12: i32 = 2;
+const EDGE_TRIGGER_PX: i32 = 8;
 const WHEEL_DELTA: i32 = 120;
 
 static HOST_STATE: OnceLock<Mutex<HostState>> = OnceLock::new();
@@ -50,6 +52,7 @@ pub async fn run_host(peer: String, layout: String) -> Result<()> {
     let stream = TcpStream::connect(&peer)
         .await
         .with_context(|| format!("connect {peer}"))?;
+    stream.set_nodelay(true).context("set TCP_NODELAY")?;
     let (tx, rx) = mpsc::unbounded_channel();
     HOST_STATE
         .set(Mutex::new(HostState::new(tx, layout.clone())))
@@ -125,7 +128,7 @@ fn run_message_loop() -> Result<()> {
         let result = unsafe { GetMessageW(&mut msg, None, 0, 0) };
         if result.0 == -1 {
             unsafe {
-                release_remote_controls();
+                cleanup_host_state();
                 unregister_hotkeys(hwnd);
                 let _ = DestroyWindow(hwnd);
             }
@@ -142,7 +145,7 @@ fn run_message_loop() -> Result<()> {
     }
 
     unsafe {
-        release_remote_controls();
+        cleanup_host_state();
         unregister_hotkeys(hwnd);
         let _ = DestroyWindow(hwnd);
     }
@@ -216,20 +219,12 @@ unsafe fn register_hotkey(hwnd: HWND) -> Result<()> {
             modifiers,
             u32::from(VK_OEM_5.0),
         )
-        .context("RegisterHotKey Ctrl+Alt+\\")?;
-        RegisterHotKey(
-            Some(hwnd),
-            HOTKEY_ID_TOGGLE_F12,
-            modifiers,
-            u32::from(VK_F12.0),
-        )
-        .context("RegisterHotKey Ctrl+Alt+F12")
+        .context("RegisterHotKey Ctrl+Alt+\\")
     }
 }
 
 unsafe fn unregister_hotkeys(hwnd: HWND) {
     let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_ID_TOGGLE_BACKSLASH) };
-    let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_ID_TOGGLE_F12) };
 }
 
 unsafe extern "system" fn wnd_proc(
@@ -239,18 +234,8 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
-        WM_HOTKEY
-            if matches!(
-                wparam.0 as i32,
-                HOTKEY_ID_TOGGLE_BACKSLASH | HOTKEY_ID_TOGGLE_F12
-            ) =>
-        {
-            let reason = if wparam.0 as i32 == HOTKEY_ID_TOGGLE_F12 {
-                "hotkey Ctrl+Alt+F12"
-            } else {
-                "hotkey Ctrl+Alt+\\"
-            };
-            if let Err(err) = toggle_remote(reason) {
+        WM_HOTKEY if wparam.0 as i32 == HOTKEY_ID_TOGGLE_BACKSLASH => {
+            if let Err(err) = toggle_remote("hotkey Ctrl+Alt+\\") {
                 error!(?err, "toggle failed");
             }
             LRESULT(0)
@@ -263,7 +248,7 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_DESTROY => {
             unsafe {
-                release_remote_controls();
+                cleanup_host_state();
                 PostQuitMessage(0);
             }
             LRESULT(0)
@@ -416,12 +401,71 @@ fn cursor_at_left_edge() -> bool {
         if GetCursorPos(&mut point).is_err() {
             return false;
         }
-        point.x <= GetSystemMetrics(SM_XVIRTUALSCREEN) + 1
+        point.x <= GetSystemMetrics(SM_XVIRTUALSCREEN) + EDGE_TRIGGER_PX
     }
 }
 
 unsafe fn release_remote_controls() {
     let _ = unsafe { ClipCursor(None) };
+}
+
+unsafe fn cleanup_host_state() {
+    if let Some(state) = HOST_STATE.get()
+        && let Ok(mut state) = state.lock()
+    {
+        state.release_local_controls(true);
+        state.remote_active = false;
+        return;
+    }
+
+    unsafe {
+        release_remote_controls();
+    }
+}
+
+unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 && remote_is_active() {
+        return LRESULT(1);
+    }
+
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 {
+        let message = wparam.0 as u32;
+        if message == WM_KEYDOWN || message == WM_SYSKEYDOWN {
+            let key = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+            if key.vkCode == u32::from(VK_OEM_5.0) && ctrl_alt_down() {
+                if let Err(err) = toggle_remote("hotkey Ctrl+Alt+\\") {
+                    error!(?err, "toggle failed");
+                }
+                return LRESULT(1);
+            }
+        }
+
+        if remote_is_active() {
+            return LRESULT(1);
+        }
+    }
+
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+fn remote_is_active() -> bool {
+    HOST_STATE
+        .get()
+        .and_then(|state| state.lock().ok().map(|state| state.remote_active))
+        .unwrap_or(false)
+}
+
+fn ctrl_alt_down() -> bool {
+    (key_down(VK_CONTROL.0) || key_down(VK_LCONTROL.0) || key_down(VK_RCONTROL.0))
+        && (key_down(VK_MENU.0) || key_down(VK_LMENU.0) || key_down(VK_RMENU.0))
+}
+
+fn key_down(vkey: u16) -> bool {
+    unsafe { GetAsyncKeyState(i32::from(vkey)) < 0 }
 }
 
 fn lock_state() -> Result<std::sync::MutexGuard<'static, HostState>> {
@@ -445,6 +489,9 @@ struct HostState {
     layout: String,
     pressed_modifier_keys: HashSet<u16>,
     active_modifiers: HashSet<Modifier>,
+    mouse_hook: Option<isize>,
+    keyboard_hook: Option<isize>,
+    saved_cursor_pos: Option<POINT>,
 }
 
 impl HostState {
@@ -455,6 +502,9 @@ impl HostState {
             layout,
             pressed_modifier_keys: HashSet::new(),
             active_modifiers: HashSet::new(),
+            mouse_hook: None,
+            keyboard_hook: None,
+            saved_cursor_pos: None,
         }
     }
 
@@ -463,16 +513,17 @@ impl HostState {
             return Ok(());
         }
 
-        self.remote_active = active;
         self.pressed_modifier_keys.clear();
         self.active_modifiers.clear();
 
         if active {
-            unsafe { clip_cursor_to_left_edge()? };
+            self.capture_local_controls()?;
+            self.remote_active = true;
             self.send(HostCommand::HostState { active, reason })?;
             info!(reason, "remote macOS control enabled");
         } else {
-            unsafe { release_remote_controls() };
+            self.remote_active = false;
+            self.release_local_controls(true);
             self.send(HostCommand::HostState { active, reason })?;
             self.send(HostCommand::Reset)?;
             info!(reason, "remote macOS control disabled");
@@ -527,19 +578,83 @@ impl HostState {
             }]
         }
     }
+
+    fn capture_local_controls(&mut self) -> Result<()> {
+        let cursor = current_cursor_position().unwrap_or_else(|_| POINT {
+            x: unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) },
+            y: unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) },
+        });
+        self.saved_cursor_pos = Some(cursor);
+        self.install_hooks()?;
+        unsafe {
+            clip_cursor_to_point(cursor)?;
+            SetCursorPos(cursor.x, cursor.y).context("SetCursorPos freeze")?;
+        }
+        Ok(())
+    }
+
+    fn release_local_controls(&mut self, restore_cursor: bool) {
+        unsafe {
+            release_remote_controls();
+        }
+        self.uninstall_hooks();
+
+        if restore_cursor
+            && let Some(cursor) = self.saved_cursor_pos.take()
+            && let Err(err) = unsafe { SetCursorPos(cursor.x, cursor.y) }
+        {
+            warn!(?err, "failed to restore Windows cursor position");
+        }
+    }
+
+    fn install_hooks(&mut self) -> Result<()> {
+        if self.mouse_hook.is_none() {
+            let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0) }
+                .context("SetWindowsHookExW WH_MOUSE_LL")?;
+            self.mouse_hook = Some(hook.0 as isize);
+        }
+
+        if self.keyboard_hook.is_none() {
+            let hook =
+                unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0) }
+                    .context("SetWindowsHookExW WH_KEYBOARD_LL")?;
+            self.keyboard_hook = Some(hook.0 as isize);
+        }
+
+        Ok(())
+    }
+
+    fn uninstall_hooks(&mut self) {
+        if let Some(hook) = self.mouse_hook.take() {
+            uninstall_hook(hook, "WH_MOUSE_LL");
+        }
+        if let Some(hook) = self.keyboard_hook.take() {
+            uninstall_hook(hook, "WH_KEYBOARD_LL");
+        }
+    }
 }
 
-unsafe fn clip_cursor_to_left_edge() -> Result<()> {
-    let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
-    let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
-    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
-    let rect = windows::Win32::Foundation::RECT {
-        left,
-        top,
-        right: left + 2,
-        bottom: top + height,
+fn current_cursor_position() -> Result<POINT> {
+    let mut point = POINT::default();
+    unsafe { GetCursorPos(&mut point).context("GetCursorPos")? };
+    Ok(point)
+}
+
+unsafe fn clip_cursor_to_point(point: POINT) -> Result<()> {
+    let rect = RECT {
+        left: point.x,
+        top: point.y,
+        right: point.x + 1,
+        bottom: point.y + 1,
     };
-    unsafe { ClipCursor(Some(&rect)).context("ClipCursor left edge") }
+    unsafe { ClipCursor(Some(&rect)).context("ClipCursor saved cursor point") }
+}
+
+fn uninstall_hook(handle: isize, name: &'static str) {
+    let hook = HHOOK(handle as *mut c_void);
+    if let Err(err) = unsafe { UnhookWindowsHookEx(hook) } {
+        warn!(?err, name, "failed to uninstall Windows hook");
+    }
 }
 
 fn modifier_for_vkey(vkey: u16) -> Option<Modifier> {

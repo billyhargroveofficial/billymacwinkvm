@@ -1,6 +1,6 @@
-#[cfg(unix)]
-use anyhow::Context;
 use anyhow::Result;
+#[cfg(unix)]
+use anyhow::{Context, bail};
 use serde::Serialize;
 use tracing::info;
 
@@ -298,6 +298,54 @@ impl KarabinerClient {
         tokio::io::AsyncWriteExt::write_all(&mut self.stream, &body).await?;
         tokio::io::AsyncWriteExt::flush(&mut self.stream).await?;
 
+        self.read_response(request_id).await
+    }
+
+    async fn read_response(&mut self, request_id: u64) -> Result<()> {
+        loop {
+            let mut len = [0_u8; 4];
+            tokio::io::AsyncReadExt::read_exact(&mut self.stream, &mut len).await?;
+            let len = u32::from_be_bytes(len) as usize;
+            if len == 0 {
+                bail!("Karabiner frame is empty");
+            }
+
+            let mut body = vec![0_u8; len];
+            tokio::io::AsyncReadExt::read_exact(&mut self.stream, &mut body).await?;
+
+            match body[0] {
+                0 => {
+                    // heartbeat
+                }
+                2 => {
+                    // health_check
+                    self.write_control_frame(3, &[]).await?;
+                }
+                5 => {
+                    if body.len() < 9 {
+                        bail!("Karabiner response frame is too short");
+                    }
+                    let response_id = u64::from_be_bytes(body[1..9].try_into()?);
+                    if response_id == request_id {
+                        return Ok(());
+                    }
+                }
+                _ => {
+                    // Ignore unrelated protocol frames while waiting for our response.
+                }
+            }
+        }
+    }
+
+    async fn write_control_frame(&mut self, message_type: u8, payload: &[u8]) -> Result<()> {
+        let len = 1 + payload.len();
+        let len = u32::try_from(len).context("Karabiner control frame too large")?;
+        tokio::io::AsyncWriteExt::write_all(&mut self.stream, &len.to_be_bytes()).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut self.stream, &[message_type]).await?;
+        if !payload.is_empty() {
+            tokio::io::AsyncWriteExt::write_all(&mut self.stream, payload).await?;
+        }
+        tokio::io::AsyncWriteExt::flush(&mut self.stream).await?;
         Ok(())
     }
 }

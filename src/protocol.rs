@@ -100,6 +100,7 @@ pub enum KeyCode {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(windows, allow(dead_code))]
 pub enum MacModifierPolicy {
     /// Windows-like muscle memory for remote Mac: Alt -> Command, Super -> Option.
     SwapAltSuper,
@@ -107,6 +108,7 @@ pub enum MacModifierPolicy {
     Native,
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 impl MacModifierPolicy {
     pub fn map(self, modifier: Modifier) -> MacModifier {
         match (self, modifier) {
@@ -121,6 +123,7 @@ impl MacModifierPolicy {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(windows, allow(dead_code))]
 pub enum MacModifier {
     Command,
     Option,
