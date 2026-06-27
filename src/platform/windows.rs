@@ -615,7 +615,7 @@ impl SharedUdpMotionWriter {
         let writer = Self {
             socket: Arc::new(socket),
             seq: Arc::new(AtomicU64::new(1)),
-            confirmed: Arc::new(AtomicBool::new(false)),
+            confirmed: Arc::new(AtomicBool::new(true)),
             pending_dx: Arc::new(AtomicI32::new(0)),
             pending_dy: Arc::new(AtomicI32::new(0)),
         };

@@ -7,7 +7,7 @@ use std::collections::HashSet;
 #[cfg(unix)]
 use std::sync::Arc;
 #[cfg(unix)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 #[cfg(unix)]
 use std::time::Instant;
 #[cfg(unix)]
@@ -106,6 +106,9 @@ fn candidate_paths() -> Vec<&'static str> {
 
 pub const KARABINER_SOCKET: &str =
     "/Library/Application Support/org.pqrs/tmp/rootonly/karabiner_virtual_hid_device_service.sock";
+
+#[cfg(unix)]
+static KARABINER_POINTING_BUTTONS: AtomicU32 = AtomicU32::new(0);
 
 #[cfg(unix)]
 pub async fn karabiner_sink_async() -> Result<Box<dyn HidSink>> {
@@ -461,7 +464,13 @@ impl KarabinerSink {
             let y = take_i8_chunk(&mut dy);
             let v = take_i8_chunk(&mut vertical_wheel);
             let h = take_i8_chunk(&mut horizontal_wheel);
-            reports.push((self.buttons, x, y, v, h));
+            reports.push((
+                KARABINER_POINTING_BUTTONS.load(Ordering::Relaxed),
+                x,
+                y,
+                v,
+                h,
+            ));
         }
 
         self.client.post_pointing_reports(&reports).await
@@ -498,6 +507,7 @@ impl HidSink for KarabinerSink {
                     KeyState::Down => self.buttons |= bit,
                     KeyState::Up => self.buttons &= !bit,
                 }
+                KARABINER_POINTING_BUTTONS.store(self.buttons, Ordering::Relaxed);
                 self.client.post_pointing(self.buttons, 0, 0, 0, 0).await
             }
             InputEvent::Modifier { modifier, state } => {
@@ -527,6 +537,7 @@ impl HidSink for KarabinerSink {
 
     async fn reset(&mut self) -> Result<()> {
         self.buttons = 0;
+        KARABINER_POINTING_BUTTONS.store(0, Ordering::Relaxed);
         self.modifiers = 0;
         self.keys.clear();
         self.client.post_pointing(0, 0, 0, 0, 0).await?;

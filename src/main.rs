@@ -14,7 +14,9 @@ use protocol::{
     Modifier, MotionDatagram, MouseButton, ProtocolHello,
 };
 use std::collections::HashSet;
-use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
+use std::net::UdpSocket as StdUdpSocket;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::net::{
     TcpStream, UdpSocket,
@@ -158,10 +160,11 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
     let udp_socket = UdpSocket::bind(&listen)
         .await
         .with_context(|| format!("bind udp motion {listen}"))?;
-    let (motion_tx, mut motion_rx) = mpsc::unbounded_channel();
-    tokio::spawn(udp_motion_reader_task(udp_socket, motion_tx));
+    let motion_shared = Arc::new(MacMotionShared::default());
+    let (motion_event_tx, mut motion_event_rx) = mpsc::unbounded_channel();
+    start_mac_motion_tasks(udp_socket, sink, motion_shared.clone(), motion_event_tx).await?;
     info!(%listen, "softkvm client listening");
-    info!(%listen, "softkvm udp motion listening");
+    info!(%listen, "softkvm direct udp motion worker listening");
 
     loop {
         let (stream, addr) = listener.accept().await?;
@@ -169,7 +172,6 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
         if let Err(err) = stream.set_nodelay(true) {
             warn!(?err, "failed to set TCP_NODELAY on accepted host stream");
         }
-        while motion_rx.try_recv().is_ok() {}
 
         let (read_half, write_half) = stream.into_split();
         let mut writer = transport::FrameWriter::new(write_half);
@@ -207,64 +209,34 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
                         };
                         ClientEvent::Tcp(event)
                     }
-                    motion = motion_rx.recv() => {
-                        let Some(motion) = motion else {
+                    motion_event = motion_event_rx.recv() => {
+                        let Some(motion_event) = motion_event else {
                             continue;
                         };
-                        ClientEvent::Motion(motion)
+                        ClientEvent::Motion(motion_event)
                     }
                 }
             };
 
             let (frame, read_at) = match event {
-                ClientEvent::Motion(motion) => {
-                    if motion.addr.ip() != addr.ip() {
-                        trace!(
-                            motion_addr = %motion.addr,
-                            tcp_addr = %addr,
-                            "ignoring udp motion from non-active host"
-                        );
-                        continue;
-                    }
-
-                    let queue_elapsed = motion.read_at.elapsed();
-                    if latency::report(queue_elapsed) {
-                        let level = if latency::slow(queue_elapsed) {
-                            "slow"
-                        } else {
-                            "trace"
-                        };
-                        info!(
-                            target: "softkvm::latency",
-                            level,
-                            seq = motion.packet.seq,
-                            queue_ms = latency::ms(queue_elapsed),
-                            "mac udp motion queue latency"
-                        );
-                    }
-
+                ClientEvent::Motion(MacMotionEvent::ReleaseHost { entry_y_ratio }) => {
                     if !client_state.remote_active {
                         continue;
                     }
-                    if !client_state.udp_motion_ready_sent {
-                        send_udp_motion_ready(
-                            &mut writer,
-                            client_session_id,
-                            &mut client_seq,
-                            &mut client_state,
-                        )
-                        .await;
-                    }
-                    if motion.packet.dx == 0 && motion.packet.dy == 0 {
-                        continue;
-                    }
                     touched_input = true;
-                    client_state.queue_motion(
-                        motion.packet.dx,
-                        motion.packet.dy,
-                        "udp",
-                        motion.packet.seq,
-                    );
+                    motion_shared.set_remote_active(false);
+                    request_host_release(
+                        &mut hid_sink,
+                        sink,
+                        &mut writer,
+                        client_session_id,
+                        &mut client_seq,
+                        &mut client_state,
+                        "mac right edge",
+                        Some(0.02),
+                        entry_y_ratio,
+                    )
+                    .await;
                     continue;
                 }
                 ClientEvent::Tcp(ClientReadEvent::Frame { frame, read_at }) => (frame, read_at),
@@ -311,6 +283,7 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
                     }
                     info!(?state, "host state");
                     client_state.set_remote_active(state.remote_active);
+                    motion_shared.set_remote_active(state.remote_active);
                     if state.remote_active {
                         position_mac_cursor(state.entry_x_ratio, state.entry_y_ratio);
                     } else {
@@ -366,6 +339,7 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
                     touched_input = true;
                     client_state.clear_pending_motion();
                     client_state.reset_keys();
+                    motion_shared.set_remote_active(false);
                     reset_input(&mut hid_sink, sink).await;
                 }
                 Message::Heartbeat { monotonic_ms } => {
@@ -384,6 +358,7 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
         }
 
         if touched_input {
+            motion_shared.set_remote_active(false);
             reset_input(&mut hid_sink, sink).await;
         }
     }
@@ -391,19 +366,17 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
 
 enum ClientEvent {
     Tcp(ClientReadEvent),
-    Motion(UdpMotionEvent),
+    Motion(MacMotionEvent),
+}
+
+enum MacMotionEvent {
+    ReleaseHost { entry_y_ratio: Option<f64> },
 }
 
 enum ClientReadEvent {
     Frame { frame: Frame, read_at: Instant },
     Disconnected,
     Failed(anyhow::Error),
-}
-
-struct UdpMotionEvent {
-    packet: MotionDatagram,
-    addr: SocketAddr,
-    read_at: Instant,
 }
 
 async fn client_reader_task(read_half: OwnedReadHalf, tx: mpsc::UnboundedSender<ClientReadEvent>) {
@@ -433,32 +406,154 @@ async fn client_reader_task(read_half: OwnedReadHalf, tx: mpsc::UnboundedSender<
     }
 }
 
-async fn udp_motion_reader_task(socket: UdpSocket, tx: mpsc::UnboundedSender<UdpMotionEvent>) {
+#[derive(Default)]
+struct MacMotionShared {
+    remote_active: AtomicBool,
+    pending_dx: AtomicI32,
+    pending_dy: AtomicI32,
+    source_seq: AtomicU64,
+    release_requested: AtomicBool,
+}
+
+impl MacMotionShared {
+    fn set_remote_active(&self, active: bool) {
+        self.remote_active.store(active, Ordering::Release);
+        self.pending_dx.store(0, Ordering::Release);
+        self.pending_dy.store(0, Ordering::Release);
+        self.release_requested.store(false, Ordering::Release);
+    }
+
+    fn queue_motion(&self, packet: MotionDatagram) {
+        if !self.remote_active.load(Ordering::Acquire) || (packet.dx == 0 && packet.dy == 0) {
+            return;
+        }
+        accumulate_motion(&self.pending_dx, packet.dx);
+        accumulate_motion(&self.pending_dy, packet.dy);
+        self.source_seq.store(packet.seq, Ordering::Release);
+    }
+
+    fn take_motion(&self) -> Option<(i32, i32, u64)> {
+        if !self.remote_active.load(Ordering::Acquire) {
+            return None;
+        }
+        let dx = self.pending_dx.swap(0, Ordering::AcqRel);
+        let dy = self.pending_dy.swap(0, Ordering::AcqRel);
+        if dx == 0 && dy == 0 {
+            return None;
+        }
+        Some((dx, dy, self.source_seq.load(Ordering::Acquire)))
+    }
+
+    fn request_release_once(&self) -> bool {
+        !self.release_requested.swap(true, Ordering::AcqRel)
+    }
+}
+
+fn accumulate_motion(cell: &AtomicI32, delta: i32) {
+    let _ = cell.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(
+            current
+                .saturating_add(delta)
+                .clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH),
+        )
+    });
+}
+
+async fn start_mac_motion_tasks(
+    socket: UdpSocket,
+    sink: SinkKind,
+    shared: Arc<MacMotionShared>,
+    event_tx: mpsc::UnboundedSender<MacMotionEvent>,
+) -> Result<()> {
+    let motion_sink = make_sink(sink).await?;
+    tokio::spawn(mac_udp_motion_accumulator_task(socket, shared.clone()));
+    tokio::spawn(mac_motion_writer_task(motion_sink, sink, shared, event_tx));
+    Ok(())
+}
+
+async fn mac_udp_motion_accumulator_task(socket: UdpSocket, shared: Arc<MacMotionShared>) {
     let mut buffer = [0_u8; MOTION_DATAGRAM_LEN];
     loop {
         match socket.recv_from(&mut buffer).await {
             Ok((len, addr)) => {
-                let read_at = Instant::now();
                 let Some(packet) = MotionDatagram::decode(&buffer[..len]) else {
                     if latency::enabled() {
                         warn!(%addr, len, "ignored malformed udp motion packet");
                     }
                     continue;
                 };
-                if tx
-                    .send(UdpMotionEvent {
-                        packet,
-                        addr,
-                        read_at,
-                    })
-                    .is_err()
-                {
-                    break;
-                }
+                shared.queue_motion(packet);
             }
             Err(err) => {
                 warn!(?err, "udp motion reader failed");
                 break;
+            }
+        }
+    }
+}
+
+async fn mac_motion_writer_task(
+    mut motion_sink: Box<dyn HidSink>,
+    sink: SinkKind,
+    shared: Arc<MacMotionShared>,
+    event_tx: mpsc::UnboundedSender<MacMotionEvent>,
+) {
+    let mut timer = interval(mac_motion_flush_interval());
+    timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut right_edge_release_armed = false;
+    let mut was_active = false;
+
+    loop {
+        timer.tick().await;
+        let active = shared.remote_active.load(Ordering::Acquire);
+        if active != was_active {
+            right_edge_release_armed = false;
+            was_active = active;
+        }
+        if !active {
+            continue;
+        }
+
+        let Some((dx, dy, source_seq)) = shared.take_motion() else {
+            continue;
+        };
+
+        if right_edge_release_armed && dx > 0 && mac_cursor_at_right_edge() {
+            if shared.request_release_once() {
+                let (_, y_ratio) = mac_cursor_ratios().unwrap_or((0.0, 0.5));
+                let _ = event_tx.send(MacMotionEvent::ReleaseHost {
+                    entry_y_ratio: Some(y_ratio),
+                });
+            }
+            continue;
+        }
+
+        let started = Instant::now();
+        apply_input(&mut motion_sink, sink, InputEvent::MouseMotion { dx, dy }).await;
+        let elapsed = started.elapsed();
+        if latency::report(elapsed) {
+            info!(
+                target: "softkvm::latency",
+                source_seq,
+                dx,
+                dy,
+                elapsed_ms = latency::ms(elapsed),
+                "mac direct motion worker apply latency"
+            );
+        }
+
+        if dx < 0
+            && mac_cursor_right_gap().is_some_and(|gap| gap >= MAC_RIGHT_EDGE_RELEASE_REARM_PX)
+        {
+            right_edge_release_armed = true;
+        }
+
+        if right_edge_release_armed && dx > 0 && mac_cursor_at_right_edge() {
+            if shared.request_release_once() {
+                let (_, y_ratio) = mac_cursor_ratios().unwrap_or((0.0, 0.5));
+                let _ = event_tx.send(MacMotionEvent::ReleaseHost {
+                    entry_y_ratio: Some(y_ratio),
+                });
             }
         }
     }
@@ -610,39 +705,12 @@ async fn request_host_release(
     reset_input(hid_sink, sink).await;
 }
 
-async fn send_udp_motion_ready(
-    writer: &mut transport::FrameWriter<OwnedWriteHalf>,
-    client_session_id: Uuid,
-    client_seq: &mut u64,
-    client_state: &mut ClientRuntimeState,
-) {
-    if client_state.udp_motion_ready_sent {
-        return;
-    }
-    if let Err(err) = writer
-        .write_frame(Frame::new(
-            client_session_id,
-            *client_seq,
-            Message::ClientControl(ClientControlEvent::UdpMotionReady),
-        ))
-        .await
-    {
-        warn!(?err, "failed to acknowledge udp motion");
-        return;
-    }
-
-    *client_seq += 1;
-    client_state.udp_motion_ready_sent = true;
-    info!("acknowledged udp motion transport");
-}
-
 #[derive(Default)]
 struct ClientRuntimeState {
     remote_active: bool,
     active_modifiers: HashSet<Modifier>,
     right_edge_release_armed: bool,
     just_activated: bool,
-    udp_motion_ready_sent: bool,
     pending_motion: Option<PendingClientMotion>,
 }
 
@@ -662,7 +730,6 @@ impl ClientRuntimeState {
         self.clear_pending_motion();
         self.right_edge_release_armed = false;
         self.just_activated = active;
-        self.udp_motion_ready_sent = false;
     }
 
     fn reset_keys(&mut self) {
