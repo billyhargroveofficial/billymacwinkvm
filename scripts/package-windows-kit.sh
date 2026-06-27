@@ -83,6 +83,12 @@ For ARM64 Windows, use:
 Check the exact build:
 
 .\\softkvm.exe build-info
+
+Diagnose real Windows mouse cadence before involving macOS:
+
+.\\softkvm.exe win-raw-cadence --seconds 30 --mode raw-only
+.\\softkvm.exe win-raw-cadence --seconds 30 --mode hooks-passive
+.\\softkvm.exe win-raw-cadence --seconds 30 --mode hooks-suppress
 EOF
 
 rm -f "$zip_path" "$latest_zip"

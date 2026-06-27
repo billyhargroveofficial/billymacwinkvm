@@ -7,7 +7,7 @@ mod transport;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use cli::{BenchTiming, BenchTransport, Cli, Command, SinkKind};
+use cli::{BenchTiming, BenchTransport, Cli, Command, SinkKind, WinRawCadenceMode};
 use hid::{HidSink, KarabinerProbe, LogSink};
 use protocol::{
     ClientControlEvent, Frame, InputEvent, KeyCode, KeyState, MOTION_DATAGRAM_LEN, Message,
@@ -60,6 +60,7 @@ async fn main() -> Result<()> {
             seconds,
             dx,
         } => run_motion_bench(peer, transport, timing, hz, seconds, dx).await,
+        Command::WinRawCadence { seconds, mode } => run_win_raw_cadence(seconds, mode),
         Command::Host { peer, layout } => run_host(peer, layout).await,
     }
 }
@@ -1171,6 +1172,24 @@ async fn run_host(_peer: String, _layout: String) -> Result<()> {
         bail!(
             "host capture is Windows-only for the first MVP; use `probe` from macOS for client testing"
         )
+    }
+}
+
+fn run_win_raw_cadence(_seconds: u32, _mode: WinRawCadenceMode) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let (install_mouse_hook, suppress_mouse, mode_name) = match _mode {
+            WinRawCadenceMode::RawOnly => (false, false, "raw-only"),
+            WinRawCadenceMode::HooksPassive => (true, false, "hooks-passive"),
+            WinRawCadenceMode::HooksSuppress => (true, true, "hooks-suppress"),
+        };
+        platform::windows::run_raw_cadence(_seconds, install_mouse_hook, suppress_mouse, mode_name)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (_seconds, _mode);
+        bail!("win-raw-cadence is Windows-only; run it from the Windows test kit")
     }
 }
 

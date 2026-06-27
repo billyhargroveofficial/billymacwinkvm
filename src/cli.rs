@@ -64,6 +64,15 @@ pub enum Command {
         dx: i32,
     },
 
+    /// Measure real Windows Raw Input cadence without involving macOS.
+    WinRawCadence {
+        #[arg(long, default_value_t = 60)]
+        seconds: u32,
+
+        #[arg(long, value_enum, default_value_t = WinRawCadenceMode::RawOnly)]
+        mode: WinRawCadenceMode,
+    },
+
     /// Run Windows host capture.
     Host {
         #[arg(long)]
@@ -91,4 +100,14 @@ pub enum BenchTransport {
 pub enum BenchTiming {
     Sleep,
     Spin,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum WinRawCadenceMode {
+    /// Raw Input only: no low-level mouse hook.
+    RawOnly,
+    /// Install WH_MOUSE_LL but always pass events through.
+    HooksPassive,
+    /// Install WH_MOUSE_LL and suppress mouse events for the timed run.
+    HooksSuppress,
 }

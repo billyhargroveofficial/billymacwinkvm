@@ -34,6 +34,27 @@ Important: plain `prlctl exec` runs as `nt authority\system`, which is not an in
 
 ## Real Machine Minimal Test
 
+Before moving the pointer to macOS, isolate the real Windows input path.
+
+Run these from the Windows kit folder and move the real physical mouse in
+continuous circles until each summary prints:
+
+```powershell
+.\softkvm.exe win-raw-cadence --seconds 30 --mode raw-only
+.\softkvm.exe win-raw-cadence --seconds 30 --mode hooks-passive
+.\softkvm.exe win-raw-cadence --seconds 30 --mode hooks-suppress
+```
+
+Read the `raw_gap_ms` lines first:
+
+- If `raw-only` already has `p99.9` or `max` gaps above roughly 10-12 ms, the
+  freeze is born before networking/macOS: Windows HID, Raw Input scheduling,
+  USB, DPC, polling rate, or the current one-by-one `GetRawInputData` path.
+- If `raw-only` is clean but `hooks-passive` or `hooks-suppress` is bad, the
+  low-level mouse hook/suppression path is the primary suspect.
+- If all three are clean, keep looking downstream: UDP/network, Mac scheduling,
+  Karabiner, or visible cursor/compositor.
+
 On the Mac, start a log receiver:
 
 ```bash

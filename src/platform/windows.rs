@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::net::UdpSocket as StdUdpSocket;
@@ -38,13 +38,13 @@ use windows::Win32::UI::Input::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, ClipCursor, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetCursorPos, GetMessageW, GetSystemMetrics, HC_ACTION, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT,
-    MSG, PostQuitMessage, RI_KEY_BREAK, RI_MOUSE_BUTTON_1_DOWN, RI_MOUSE_BUTTON_1_UP,
+    KillTimer, MSG, PostQuitMessage, RI_KEY_BREAK, RI_MOUSE_BUTTON_1_DOWN, RI_MOUSE_BUTTON_1_UP,
     RI_MOUSE_BUTTON_2_DOWN, RI_MOUSE_BUTTON_2_UP, RI_MOUSE_BUTTON_3_DOWN, RI_MOUSE_BUTTON_3_UP,
     RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP, RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP,
     RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL, RegisterClassW, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    SetCursorPos, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY, WM_HOTKEY, WM_INPUT, WM_KEYDOWN,
-    WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
+    SetCursorPos, SetTimer, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY, WM_HOTKEY, WM_INPUT,
+    WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW,
 };
 use windows::core::w;
 
@@ -68,9 +68,11 @@ const WINDOWS_RESTORE_EDGE_INSET_PX: i32 = 32;
 const WHEEL_DELTA: i32 = 120;
 const SCANCODE_BACKSLASH: u32 = 0x2b;
 const SCANCODE_NON_US_BACKSLASH: u32 = 0x56;
+const RAW_CADENCE_TIMER_ID: usize = 3;
 
 static HOST_STATE: OnceLock<Mutex<HostState>> = OnceLock::new();
 static REMOTE_ACTIVE_FAST: AtomicBool = AtomicBool::new(false);
+static RAW_CADENCE_STATE: OnceLock<Mutex<RawCadenceState>> = OnceLock::new();
 
 pub fn prepare_low_latency_process() {
     let timer_result = unsafe { timeBeginPeriod(1) };
@@ -126,6 +128,394 @@ pub async fn run_host(peer: String, layout: String) -> Result<()> {
         .await
         .context("join Windows host message loop")?
         .context("run Windows host message loop")
+}
+
+pub fn run_raw_cadence(
+    seconds: u32,
+    install_mouse_hook: bool,
+    suppress_mouse: bool,
+    mode_name: &'static str,
+) -> Result<()> {
+    let seconds = seconds.clamp(1, 600);
+    prepare_low_latency_thread("Raw Input cadence diagnostic");
+
+    RAW_CADENCE_STATE
+        .set(Mutex::new(RawCadenceState::new(
+            seconds,
+            mode_name,
+            install_mouse_hook,
+            suppress_mouse,
+        )))
+        .map_err(|_| anyhow!("raw cadence diagnostic can only run once per process"))?;
+
+    let hwnd = unsafe { create_raw_cadence_window()? };
+    let setup = unsafe { register_raw_cadence_input(hwnd) };
+    if let Err(err) = setup {
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+        return Err(err);
+    }
+
+    let hook = if install_mouse_hook {
+        Some(
+            unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(raw_cadence_mouse_hook_proc), None, 0) }
+                .context("SetWindowsHookExW WH_MOUSE_LL raw cadence")?,
+        )
+    } else {
+        None
+    };
+
+    let timer_ms = seconds.saturating_mul(1000);
+    let timer = unsafe { SetTimer(Some(hwnd), RAW_CADENCE_TIMER_ID, timer_ms, None) };
+    if timer == 0 {
+        if let Some(hook) = hook {
+            uninstall_hook(hook.0 as isize, "WH_MOUSE_LL raw cadence");
+        }
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+        bail!("SetTimer failed for raw cadence diagnostic");
+    }
+
+    println!("softkvm win-raw-cadence");
+    println!("mode={mode_name} seconds={seconds}");
+    println!("Move the real Windows mouse continuously until the summary prints.");
+    if suppress_mouse {
+        println!("Mouse events are suppressed for this timed run; keyboard remains live.");
+    }
+
+    let mut msg = MSG::default();
+    loop {
+        let result = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+        if result.0 == -1 {
+            break;
+        }
+        if result.0 == 0 {
+            break;
+        }
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    unsafe {
+        let _ = KillTimer(Some(hwnd), RAW_CADENCE_TIMER_ID);
+    }
+    if let Some(hook) = hook {
+        uninstall_hook(hook.0 as isize, "WH_MOUSE_LL raw cadence");
+    }
+    unsafe {
+        let _ = DestroyWindow(hwnd);
+    }
+
+    let state = RAW_CADENCE_STATE
+        .get()
+        .ok_or_else(|| anyhow!("raw cadence state disappeared"))?
+        .lock()
+        .map_err(|_| anyhow!("raw cadence state lock poisoned"))?;
+    state.print_summary();
+    Ok(())
+}
+
+struct RawCadenceState {
+    started: Instant,
+    seconds: u32,
+    mode_name: &'static str,
+    install_mouse_hook: bool,
+    suppress_mouse: bool,
+    total_raw_messages: u64,
+    mouse_events: u64,
+    zero_mouse_events: u64,
+    keyboard_events: u64,
+    hook_events: u64,
+    hook_suppressed: u64,
+    devices: HashMap<usize, RawCadenceDeviceStats>,
+    read_ms: Vec<f64>,
+    handler_ms: Vec<f64>,
+    hook_ms: Vec<f64>,
+}
+
+impl RawCadenceState {
+    fn new(
+        seconds: u32,
+        mode_name: &'static str,
+        install_mouse_hook: bool,
+        suppress_mouse: bool,
+    ) -> Self {
+        let expected_samples = seconds.saturating_mul(2000).max(2048) as usize;
+        Self {
+            started: Instant::now(),
+            seconds,
+            mode_name,
+            install_mouse_hook,
+            suppress_mouse,
+            total_raw_messages: 0,
+            mouse_events: 0,
+            zero_mouse_events: 0,
+            keyboard_events: 0,
+            hook_events: 0,
+            hook_suppressed: 0,
+            devices: HashMap::new(),
+            read_ms: Vec::with_capacity(expected_samples),
+            handler_ms: Vec::with_capacity(expected_samples),
+            hook_ms: Vec::with_capacity(expected_samples),
+        }
+    }
+
+    fn record_raw(&mut self, raw: RAWINPUT, message_started: Instant, read_elapsed: Duration) {
+        self.total_raw_messages += 1;
+        self.read_ms.push(latency::ms(read_elapsed));
+
+        match raw.header.dwType {
+            t if t == RIM_TYPEMOUSE.0 => {
+                let mouse = unsafe { raw.data.mouse };
+                let buttons = unsafe { mouse.Anonymous.Anonymous };
+                let flags = u32::from(buttons.usButtonFlags);
+                let dx = mouse.lLastX;
+                let dy = mouse.lLastY;
+                let nonzero = dx != 0 || dy != 0 || flags != 0;
+                if nonzero {
+                    self.mouse_events += 1;
+                    let device = raw.header.hDevice.0 as usize;
+                    self.devices
+                        .entry(device)
+                        .or_default()
+                        .record(message_started, dx, dy, flags);
+                } else {
+                    self.zero_mouse_events += 1;
+                }
+            }
+            t if t == RIM_TYPEKEYBOARD.0 => {
+                self.keyboard_events += 1;
+            }
+            _ => {}
+        }
+    }
+
+    fn record_handler_elapsed(&mut self, elapsed: Duration) {
+        self.handler_ms.push(latency::ms(elapsed));
+    }
+
+    fn record_mouse_hook(&mut self, elapsed: Duration, suppressed: bool) {
+        self.hook_events += 1;
+        if suppressed {
+            self.hook_suppressed += 1;
+        }
+        self.hook_ms.push(latency::ms(elapsed));
+    }
+
+    fn print_summary(&self) {
+        println!();
+        println!("== softkvm win-raw-cadence summary ==");
+        println!(
+            "mode={} seconds={} elapsed_ms={:.3}",
+            self.mode_name,
+            self.seconds,
+            latency::ms(self.started.elapsed())
+        );
+        println!(
+            "hooks install={} suppress_mouse={} hook_events={} hook_suppressed={}",
+            self.install_mouse_hook, self.suppress_mouse, self.hook_events, self.hook_suppressed
+        );
+        println!(
+            "raw_messages={} mouse_events={} zero_mouse_events={} keyboard_events={}",
+            self.total_raw_messages,
+            self.mouse_events,
+            self.zero_mouse_events,
+            self.keyboard_events
+        );
+        print_histogram("getrawinput_ms", &self.read_ms);
+        print_histogram("raw_handler_ms", &self.handler_ms);
+        print_histogram("mouse_hook_ms", &self.hook_ms);
+
+        if self.devices.is_empty() {
+            println!("device none: no nonzero mouse events captured");
+            return;
+        }
+
+        for (device, stats) in &self.devices {
+            println!(
+                "device=0x{device:x} events={} dx_total={} dy_total={} buttons_or_wheel_events={}",
+                stats.events, stats.dx_total, stats.dy_total, stats.button_or_wheel_events
+            );
+            print_histogram("  raw_gap_ms", &stats.gap_ms);
+        }
+    }
+}
+
+#[derive(Default)]
+struct RawCadenceDeviceStats {
+    events: u64,
+    last_event: Option<Instant>,
+    gap_ms: Vec<f64>,
+    dx_total: i64,
+    dy_total: i64,
+    button_or_wheel_events: u64,
+}
+
+impl RawCadenceDeviceStats {
+    fn record(&mut self, now: Instant, dx: i32, dy: i32, flags: u32) {
+        if let Some(last) = self.last_event.replace(now) {
+            self.gap_ms.push(latency::ms(now.duration_since(last)));
+        }
+        if self.last_event.is_none() {
+            self.last_event = Some(now);
+        }
+        self.events += 1;
+        self.dx_total += i64::from(dx);
+        self.dy_total += i64::from(dy);
+        if flags != 0 {
+            self.button_or_wheel_events += 1;
+        }
+    }
+}
+
+fn print_histogram(label: &str, samples: &[f64]) {
+    if samples.is_empty() {
+        println!("{label}: count=0");
+        return;
+    }
+
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let sum: f64 = sorted.iter().sum();
+    let mean = sum / sorted.len() as f64;
+    println!(
+        "{label}: count={} mean={:.3} p50={:.3} p95={:.3} p99={:.3} p99.9={:.3} max={:.3}",
+        sorted.len(),
+        mean,
+        percentile(&sorted, 0.50),
+        percentile(&sorted, 0.95),
+        percentile(&sorted, 0.99),
+        percentile(&sorted, 0.999),
+        sorted.last().copied().unwrap_or(0.0),
+    );
+}
+
+fn percentile(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let index = ((sorted.len() - 1) as f64 * q.clamp(0.0, 1.0)).round() as usize;
+    sorted[index]
+}
+
+unsafe fn create_raw_cadence_window() -> Result<HWND> {
+    let module = unsafe { GetModuleHandleW(None).context("GetModuleHandleW")? };
+    let hinstance = HINSTANCE(module.0);
+    let class_name = w!("SoftKvmRawCadenceWindow");
+    let class = WNDCLASSW {
+        hInstance: hinstance,
+        lpszClassName: class_name,
+        lpfnWndProc: Some(raw_cadence_wnd_proc),
+        ..Default::default()
+    };
+
+    let atom = unsafe { RegisterClassW(&class) };
+    if atom == 0 {
+        return Err(windows::core::Error::from_thread()).context("RegisterClassW raw cadence");
+    }
+
+    unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            class_name,
+            w!("softkvm raw cadence"),
+            WINDOW_STYLE(0),
+            0,
+            0,
+            0,
+            0,
+            Some(HWND_MESSAGE),
+            None,
+            Some(hinstance),
+            None,
+        )
+    }
+    .context("CreateWindowExW raw cadence")
+}
+
+unsafe fn register_raw_cadence_input(hwnd: HWND) -> Result<()> {
+    let devices = [RAWINPUTDEVICE {
+        usUsagePage: 0x01,
+        usUsage: 0x02,
+        dwFlags: RIDEV_INPUTSINK | RIDEV_DEVNOTIFY,
+        hwndTarget: hwnd,
+    }];
+
+    unsafe {
+        RegisterRawInputDevices(&devices, size_of::<RAWINPUTDEVICE>() as u32)
+            .context("RegisterRawInputDevices raw cadence")
+    }
+}
+
+unsafe extern "system" fn raw_cadence_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_INPUT => {
+            if let Err(err) = handle_raw_cadence_input(lparam) {
+                warn!(?err, "raw cadence input failed");
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_TIMER if wparam.0 == RAW_CADENCE_TIMER_ID => {
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            unsafe {
+                PostQuitMessage(0);
+            }
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+fn handle_raw_cadence_input(lparam: LPARAM) -> Result<()> {
+    let started = Instant::now();
+    let raw = unsafe { read_raw_input(lparam)? };
+    let read_elapsed = started.elapsed();
+
+    let mut state = RAW_CADENCE_STATE
+        .get()
+        .ok_or_else(|| anyhow!("raw cadence state is not initialized"))?
+        .lock()
+        .map_err(|_| anyhow!("raw cadence state lock poisoned"))?;
+    state.record_raw(raw, started, read_elapsed);
+    state.record_handler_elapsed(started.elapsed());
+    Ok(())
+}
+
+unsafe extern "system" fn raw_cadence_mouse_hook_proc(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let started = Instant::now();
+    let mut suppress = false;
+
+    if code == HC_ACTION as i32
+        && let Some(state) = RAW_CADENCE_STATE.get()
+        && let Ok(mut state) = state.lock()
+    {
+        suppress = state.suppress_mouse;
+        state.record_mouse_hook(started.elapsed(), suppress);
+    }
+
+    if suppress {
+        return LRESULT(1);
+    }
+
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
 enum MotionTransport {
