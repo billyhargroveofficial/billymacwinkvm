@@ -116,8 +116,9 @@ static CGEVENT_CURSOR_POSITION: std::sync::Mutex<Option<CGPoint>> = std::sync::M
 #[cfg(target_os = "macos")]
 static CGEVENT_POINTER_SPEED: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 #[cfg(target_os = "macos")]
-static CGEVENT_MOTION_METHOD: std::sync::OnceLock<CgEventMotionMethod> =
-    std::sync::OnceLock::new();
+static CGEVENT_MOTION_METHOD: std::sync::OnceLock<CgEventMotionMethod> = std::sync::OnceLock::new();
+#[cfg(target_os = "macos")]
+static CGEVENT_TAP: std::sync::OnceLock<CgEventTap> = std::sync::OnceLock::new();
 
 #[cfg(unix)]
 pub async fn karabiner_sink_async() -> Result<Box<dyn HidSink>> {
@@ -170,6 +171,25 @@ enum CgEventMotionMethod {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CgEventTap {
+    Hid,
+    Session,
+    AnnotatedSession,
+}
+
+#[cfg(target_os = "macos")]
+impl CgEventTap {
+    fn value(self) -> u32 {
+        match self {
+            Self::Hid => CG_HID_EVENT_TAP,
+            Self::Session => CG_SESSION_EVENT_TAP,
+            Self::AnnotatedSession => CG_ANNOTATED_SESSION_EVENT_TAP,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 struct CgEventSink {
     buttons: u32,
     modifiers: u64,
@@ -182,10 +202,15 @@ impl CgEventSink {
         let modifier_policy = MacModifierPolicy::from_env();
         let pointer_speed = cgevent_pointer_speed();
         let motion_method = cgevent_motion_method();
+        let event_tap = cgevent_tap();
+        unsafe {
+            CGSetLocalEventsSuppressionInterval(0.0);
+        }
         info!(
             ?modifier_policy,
             pointer_speed,
             ?motion_method,
+            ?event_tap,
             scroll_inverted = true,
             "using CGEvent mouse and keyboard sink"
         );
@@ -316,7 +341,7 @@ impl CgEventSink {
         let create_elapsed = started.elapsed();
         let post_started = Instant::now();
         unsafe {
-            CGEventPost(CG_HID_EVENT_TAP, event);
+            CGEventPost(cgevent_tap().value(), event);
             CFRelease(event.cast_const());
         }
         let post_elapsed = post_started.elapsed();
@@ -347,7 +372,7 @@ impl CgEventSink {
             bail!("CGEventCreateScrollWheelEvent returned null");
         }
         unsafe {
-            CGEventPost(CG_HID_EVENT_TAP, event);
+            CGEventPost(cgevent_tap().value(), event);
             CFRelease(event.cast_const());
         }
         Ok(())
@@ -378,7 +403,7 @@ impl CgEventSink {
         }
         unsafe {
             CGEventSetFlags(event, self.modifiers);
-            CGEventPost(CG_HID_EVENT_TAP, event);
+            CGEventPost(cgevent_tap().value(), event);
             CFRelease(event.cast_const());
         }
         Ok(())
@@ -692,6 +717,10 @@ struct CGPoint {
 #[cfg(target_os = "macos")]
 const CG_HID_EVENT_TAP: u32 = 0;
 #[cfg(target_os = "macos")]
+const CG_SESSION_EVENT_TAP: u32 = 1;
+#[cfg(target_os = "macos")]
+const CG_ANNOTATED_SESSION_EVENT_TAP: u32 = 2;
+#[cfg(target_os = "macos")]
 const CG_EVENT_LEFT_MOUSE_DOWN: u32 = 1;
 #[cfg(target_os = "macos")]
 const CG_EVENT_LEFT_MOUSE_UP: u32 = 2;
@@ -754,6 +783,7 @@ unsafe extern "C" {
     ) -> *mut std::ffi::c_void;
     fn CGEventSetFlags(event: *mut std::ffi::c_void, flags: u64);
     fn CGWarpMouseCursorPosition(new_cursor_position: CGPoint) -> i32;
+    fn CGSetLocalEventsSuppressionInterval(seconds: f64);
     fn CGEventPost(tap: u32, event: *mut std::ffi::c_void);
     fn CFRelease(cf: *const std::ffi::c_void);
 }
@@ -939,15 +969,42 @@ fn cgevent_pointer_speed() -> f64 {
 fn cgevent_motion_method() -> CgEventMotionMethod {
     *CGEVENT_MOTION_METHOD.get_or_init(|| {
         match std::env::var("SOFTKVM_CGEVENT_MOTION_METHOD")
-            .unwrap_or_else(|_| "warp".to_owned())
+            .unwrap_or_else(|_| "event".to_owned())
             .to_ascii_lowercase()
             .as_str()
         {
             "event" | "mouse-event" | "cgevent" => CgEventMotionMethod::Event,
             "warp" | "cursor-warp" => CgEventMotionMethod::Warp,
             other => {
-                warn!(value = other, "unknown SOFTKVM_CGEVENT_MOTION_METHOD; using warp");
-                CgEventMotionMethod::Warp
+                warn!(
+                    value = other,
+                    "unknown SOFTKVM_CGEVENT_MOTION_METHOD; using event"
+                );
+                CgEventMotionMethod::Event
+            }
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn cgevent_tap() -> CgEventTap {
+    *CGEVENT_TAP.get_or_init(|| {
+        match std::env::var("SOFTKVM_CGEVENT_TAP")
+            .unwrap_or_else(|_| "annotated-session".to_owned())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "hid" | "hid-event-tap" => CgEventTap::Hid,
+            "session" | "session-event-tap" => CgEventTap::Session,
+            "annotated" | "annotated-session" | "annotated-session-event-tap" => {
+                CgEventTap::AnnotatedSession
+            }
+            other => {
+                warn!(
+                    value = other,
+                    "unknown SOFTKVM_CGEVENT_TAP; using annotated-session"
+                );
+                CgEventTap::AnnotatedSession
             }
         }
     })

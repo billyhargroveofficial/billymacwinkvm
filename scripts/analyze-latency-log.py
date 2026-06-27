@@ -8,6 +8,8 @@ from pathlib import Path
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+)Z")
 FLOAT_RE = re.compile(r"([a-zA-Z_]+)=(-?\d+(?:\.\d+)?)")
+SLOW_P95_MS = 8.0
+SLOW_MAX_MS = 20.0
 
 
 def clean(line: str) -> str:
@@ -29,18 +31,144 @@ def percentile(values, p):
     return values[idx]
 
 
-def print_stats(name, values):
+def summarize(values):
     if not values:
+        return None
+    return {
+        "n": len(values),
+        "min": min(values),
+        "p50": percentile(values, 0.50),
+        "p95": percentile(values, 0.95),
+        "p99": percentile(values, 0.99),
+        "max": max(values),
+    }
+
+
+def print_stats(name, values):
+    stat = summarize(values)
+    if not stat:
         return
     print(
-        f"{name}: n={len(values)} "
-        f"min={min(values):.3f} p50={percentile(values, 0.50):.3f} "
-        f"p95={percentile(values, 0.95):.3f} p99={percentile(values, 0.99):.3f} "
-        f"max={max(values):.3f}"
+        f"{name}: n={stat['n']} "
+        f"min={stat['min']:.3f} p50={stat['p50']:.3f} "
+        f"p95={stat['p95']:.3f} p99={stat['p99']:.3f} "
+        f"max={stat['max']:.3f}"
     )
 
 
-def add_gap_report(name, entries):
+def format_stat(name, stat):
+    return (
+        f"{name} n={stat['n']} p95={stat['p95']:.3f}ms "
+        f"max={stat['max']:.3f}ms"
+    )
+
+
+def slow_score(stat):
+    return max(stat["p95"] / SLOW_P95_MS, stat["max"] / SLOW_MAX_MS)
+
+
+def is_slow(stat):
+    return stat["p95"] >= SLOW_P95_MS or stat["max"] >= SLOW_MAX_MS
+
+
+def strongest_metric(metrics, names):
+    strongest = None
+    for name in names:
+        stat = summarize(metrics.get(name, []))
+        if not stat:
+            continue
+        candidate = (slow_score(stat), name, stat)
+        if strongest is None or candidate[0] > strongest[0]:
+            strongest = candidate
+    return strongest
+
+
+def print_likely_source_summary(metrics, series):
+    source_rules = [
+        (
+            "Windows send/capture",
+            [
+                "windows_raw_input_ms",
+                "windows_udp_send_ms",
+            ],
+        ),
+        (
+            "network or Mac receive gap",
+            [
+                "mac_udp_receive_gap_ms",
+            ],
+        ),
+        (
+            "CGEvent/warp slow call",
+            [
+                "mac_cgevent_warp_ms",
+                "mac_cgevent_mouse_post_post_ms",
+                "mac_cgevent_mouse_post_total_ms",
+                "mac_direct_immediate_apply_ms",
+            ],
+        ),
+        (
+            "visible Mac apply/cadence gap",
+            [
+                "mac_apply_motion_gap_ms",
+                "mac_cgevent_mouse_post_gap_ms",
+                "log_sink_mouse_motion_gap_ms",
+                "mac_motion_coalesced_flush_gap_ms",
+                "mac_tcp_motion_gap_ms",
+            ],
+        ),
+    ]
+
+    evidence = []
+    for source, names in source_rules:
+        strongest = strongest_metric(metrics, names)
+        if not strongest:
+            continue
+        score, metric_name, stat = strongest
+        if is_slow(stat):
+            evidence.append((score, source, metric_name, stat))
+
+    print("summary:")
+    print(
+        f"  thresholds: p95>={SLOW_P95_MS:.1f}ms or max>={SLOW_MAX_MS:.1f}ms"
+    )
+    if evidence:
+        print("  likely_sources:")
+        for _, source, metric_name, stat in sorted(evidence, reverse=True):
+            print(f"    - {source}: {format_stat(metric_name, stat)}")
+            if (
+                source == "CGEvent/warp slow call"
+                and metric_name == "mac_direct_immediate_apply_ms"
+                and not series.get("mac_cgevent_warp")
+                and not series.get("mac_cgevent_mouse_post")
+            ):
+                print(
+                    "      note: direct Mac apply was slow, but no CGEvent marker "
+                    "was present in this log"
+                )
+    else:
+        print(
+            "  likely_source: no in-process evidence "
+            "(no parsed current marker crossed the threshold)"
+        )
+
+    for name in [
+        "windows_raw_input_ms",
+        "windows_udp_send_ms",
+        "mac_udp_receive_gap_ms",
+        "mac_direct_immediate_apply_ms",
+        "mac_cgevent_warp_ms",
+        "mac_cgevent_mouse_post_total_ms",
+        "mac_apply_motion_gap_ms",
+        "mac_cgevent_mouse_post_gap_ms",
+        "log_sink_mouse_motion_gap_ms",
+    ]:
+        stat = summarize(metrics.get(name, []))
+        if stat:
+            print(f"  evidence: {format_stat(name, stat)}")
+
+
+def add_gap_report(name, entries, metrics):
     if len(entries) < 2:
         return
     gaps = []
@@ -48,6 +176,7 @@ def add_gap_report(name, entries):
         gap = (cur_t - prev_t).total_seconds() * 1000.0
         gaps.append((gap, prev_line, cur_line, prev_t.time(), cur_t.time()))
     values = [gap for gap, *_ in gaps]
+    metrics[f"{name}_gap_ms"].extend(values)
     print_stats(f"{name}.gap_ms", values)
     slow = [gap for gap in gaps if gap[0] >= 20.0]
     if slow:
@@ -103,8 +232,10 @@ def analyze(path: Path):
             series["windows_udp_send"].append((ts, line_no))
         if "windows motion flush batch" in line:
             series["windows_tcp_motion_flush"].append((ts, line_no))
-        if "windows mouse raw input handling" in line and "remote_active=true" in line:
-            series["windows_raw_mouse_active"].append((ts, line_no))
+        if "windows mouse raw input handling" in line:
+            series["windows_raw_mouse"].append((ts, line_no))
+            if "remote_active=true" in line:
+                series["windows_raw_mouse_active"].append((ts, line_no))
 
         for key, value in FLOAT_RE.findall(line):
             if key.endswith("_ms") or key in {"queue_ms", "write_ms", "lock_ms", "elapsed_ms"}:
@@ -143,9 +274,10 @@ def analyze(path: Path):
         print("markers:", " ".join(f"{key}={value}" for key, value in sorted(markers.items())))
     for name in sorted(series):
         print(f"{name}.events: {len(series[name])}")
-        add_gap_report(name, series[name])
+        add_gap_report(name, series[name], metrics)
     for name in sorted(metrics):
         print_stats(name, metrics[name])
+    print_likely_source_summary(metrics, series)
     print()
 
 

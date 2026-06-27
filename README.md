@@ -9,7 +9,7 @@ Primary goal:
 - Mouse/keyboard should cross the screen edge.
 - `Ctrl+Alt+\` is the emergency/toggle hotkey.
 - While controlling macOS, Windows `Alt` maps to macOS `Command`, and Windows `Win/Super` maps to macOS `Option`.
-- macOS injection should go through Karabiner DriverKit VirtualHID so LinearMouse/Scroll Reverser can see a real virtual device.
+- macOS injection currently defaults to `cg-event` for lowest observed entry latency; Karabiner DriverKit VirtualHID remains available with `SOFTKVM_MAC_SINK=karabiner`.
 
 ## Current Status
 
@@ -19,7 +19,7 @@ The repo currently contains:
 - Protocol-only `client` and `probe` commands.
 - Karabiner VirtualHID wire-format encoder.
 - Windows Raw Input host MVP with `Ctrl+Alt+\` toggle and `mac-left` edge activation.
-- Split transport: TCP for reliable state/keyboard/buttons/wheel, binary UDP `SKM1` datagrams for mouse motion.
+- Motion transport defaults to TCP coalescing for better tail-latency; binary UDP `SKM1` remains available with `SOFTKVM_MOTION_TRANSPORT=udp`.
 - Native macOS `IOHIDUserDevice` probe/backend scaffold; current unsigned dev build fails without Apple's `com.apple.developer.hid.virtual.device` entitlement.
 - Setup docs under `docs/`.
 
@@ -65,8 +65,8 @@ Package a versioned Windows transfer zip:
 Each run bumps `kit-version.txt` and writes `dist/softkvm-windows-test-kit-vNNNN-<git>.zip`
 plus `dist/softkvm-windows-test-kit-latest.zip`.
 
-macOS receiver coalesces high-rate mouse deltas before writing to Karabiner.
-Default flush interval is `2ms`; for real-machine tuning:
+macOS receiver coalesces high-rate mouse deltas before posting input.
+Default flush interval is `1ms`; for real-machine tuning:
 
 ```bash
 SOFTKVM_MAC_MOTION_FLUSH_MS=1 ./scripts/mac-karabiner-client.sh

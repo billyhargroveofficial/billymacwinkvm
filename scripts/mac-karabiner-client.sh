@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${SOFTKVM_PORT:-49321}"
-SINK="${SOFTKVM_MAC_SINK:-karabiner}"
+SINK="${SOFTKVM_MAC_SINK:-cg-event}"
 SOCKET="/Library/Application Support/org.pqrs/tmp/rootonly/karabiner_virtual_hid_device_service.sock"
 
 cd "$ROOT"
@@ -43,8 +43,10 @@ sudo env \
   RUST_LOG="${RUST_LOG:-softkvm=info,softkvm::latency=info}" \
   SOFTKVM_MAC_MODIFIER_POLICY="${SOFTKVM_MAC_MODIFIER_POLICY:-swap-alt-super}" \
   SOFTKVM_CGEVENT_POINTER_SPEED="${SOFTKVM_CGEVENT_POINTER_SPEED:-1.0}" \
-  SOFTKVM_CGEVENT_MOTION_METHOD="${SOFTKVM_CGEVENT_MOTION_METHOD:-warp}" \
-  SOFTKVM_MAC_MOTION_MODE="${SOFTKVM_MAC_MOTION_MODE:-direct}" \
+  SOFTKVM_CGEVENT_MOTION_METHOD="${SOFTKVM_CGEVENT_MOTION_METHOD:-event}" \
+  SOFTKVM_CGEVENT_TAP="${SOFTKVM_CGEVENT_TAP:-annotated-session}" \
+  SOFTKVM_MAC_MOTION_MODE="${SOFTKVM_MAC_MOTION_MODE:-coalesced}" \
+  SOFTKVM_MAC_MOTION_FLUSH_MS="${SOFTKVM_MAC_MOTION_FLUSH_MS:-1}" \
   SOFTKVM_LATENCY_LOG="${SOFTKVM_LATENCY_LOG:-0}" \
   SOFTKVM_LATENCY_WARN_MS="${SOFTKVM_LATENCY_WARN_MS:-8}" \
   "$ROOT/target/debug/softkvm" client --listen "0.0.0.0:$PORT" --sink "$SINK"

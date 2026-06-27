@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::mem::size_of;
@@ -74,8 +75,14 @@ const SCANCODE_NON_US_BACKSLASH: u32 = 0x56;
 const RAW_CADENCE_TIMER_ID: usize = 3;
 
 static HOST_STATE: OnceLock<Mutex<HostState>> = OnceLock::new();
+static DIRECT_MOTION_FAST: OnceLock<SharedUdpMotionWriter> = OnceLock::new();
 static REMOTE_ACTIVE_FAST: AtomicBool = AtomicBool::new(false);
 static RAW_CADENCE_STATE: OnceLock<Mutex<RawCadenceState>> = OnceLock::new();
+
+thread_local! {
+    static RAW_INPUT_BUFFER: RefCell<Vec<RAWINPUT>> =
+        RefCell::new(vec![RAWINPUT::default(); 1024]);
+}
 
 pub fn prepare_low_latency_process() {
     let timer_result = unsafe { timeBeginPeriod(1) };
@@ -113,6 +120,9 @@ pub async fn run_host(peer: String, layout: String) -> Result<()> {
     stream.set_nodelay(true).context("set TCP_NODELAY")?;
     let motion_transport = MotionTransport::connect(&peer).await;
     let direct_motion = motion_transport.direct_writer();
+    if let Some(writer) = direct_motion.clone() {
+        let _ = DIRECT_MOTION_FAST.set(writer);
+    }
     let (tx, rx) = mpsc::unbounded_channel();
     HOST_STATE
         .set(Mutex::new(HostState::new(
@@ -528,10 +538,11 @@ enum MotionTransport {
 
 impl MotionTransport {
     async fn connect(peer: &str) -> Self {
-        if std::env::var("SOFTKVM_MOTION_TRANSPORT")
-            .is_ok_and(|value| value.eq_ignore_ascii_case("tcp"))
-        {
-            info!("using tcp/json motion transport because SOFTKVM_MOTION_TRANSPORT=tcp");
+        let configured = std::env::var("SOFTKVM_MOTION_TRANSPORT")
+            .unwrap_or_else(|_| "tcp".to_owned())
+            .to_ascii_lowercase();
+        if !matches!(configured.as_str(), "udp" | "udp-binary" | "binary") {
+            info!(mode = configured, "using tcp/json motion transport");
             return Self::Tcp;
         }
 
@@ -561,8 +572,7 @@ impl MotionTransport {
     async fn send_motion(&mut self, dx: i32, dy: i32) -> Result<bool> {
         match self {
             Self::Udp { writer } if writer.confirmed() => {
-                writer.queue_motion(dx, dy);
-                Ok(true)
+                writer.send_motion_if_confirmed(dx, dy, "writer")
             }
             Self::Udp { writer } => {
                 writer.send_motion(0, 0, "probe")?;
@@ -625,7 +635,12 @@ impl SharedUdpMotionWriter {
             pending_dx: Arc::new(AtomicI32::new(0)),
             pending_dy: Arc::new(AtomicI32::new(0)),
         };
-        writer.spawn_motion_sender();
+        if udp_send_mode() == UdpSendMode::Coalesced {
+            info!("using coalesced UDP motion sender");
+            writer.spawn_motion_sender();
+        } else {
+            info!("using immediate UDP motion sends");
+        }
         writer
     }
 
@@ -641,7 +656,7 @@ impl SharedUdpMotionWriter {
         if !self.confirmed() {
             return Ok(false);
         }
-        if path == "direct" || path == "writer" {
+        if matches!(path, "direct" | "writer" | "raw-fast") {
             match udp_send_mode() {
                 UdpSendMode::Immediate => self.send_motion_immediate(dx, dy, "direct-immediate")?,
                 UdpSendMode::Coalesced => self.queue_motion(dx, dy),
@@ -722,15 +737,18 @@ fn udp_send_mode() -> UdpSendMode {
     static MODE: OnceLock<UdpSendMode> = OnceLock::new();
     *MODE.get_or_init(|| {
         match std::env::var("SOFTKVM_UDP_SEND_MODE")
-            .unwrap_or_else(|_| "immediate".to_owned())
+            .unwrap_or_else(|_| "coalesced".to_owned())
             .to_ascii_lowercase()
             .as_str()
         {
             "immediate" | "direct" => UdpSendMode::Immediate,
             "coalesced" | "batch" | "sender-thread" => UdpSendMode::Coalesced,
             other => {
-                warn!(value = other, "unknown SOFTKVM_UDP_SEND_MODE; using immediate");
-                UdpSendMode::Immediate
+                warn!(
+                    value = other,
+                    "unknown SOFTKVM_UDP_SEND_MODE; using coalesced"
+                );
+                UdpSendMode::Coalesced
             }
         }
     })
@@ -1299,7 +1317,24 @@ fn handle_raw_input_struct(raw: RAWINPUT) -> Result<()> {
 
 fn handle_raw_input_buffered(lparam: LPARAM) -> Result<()> {
     let started = Instant::now();
-    let mut buffer = vec![RAWINPUT::default(); 1024];
+    handle_raw_input(lparam)?;
+    let drained = RAW_INPUT_BUFFER.with(|cell| drain_raw_input_buffer(&mut cell.borrow_mut()))?;
+    let total = 1 + drained;
+
+    let elapsed = started.elapsed();
+    if latency::report(elapsed) {
+        info!(
+            target: "softkvm::latency",
+            packets = total,
+            elapsed_ms = latency::ms(elapsed),
+            "windows buffered raw input drain"
+        );
+    }
+
+    Ok(())
+}
+
+fn drain_raw_input_buffer(buffer: &mut Vec<RAWINPUT>) -> Result<usize> {
     let mut total = 0_usize;
 
     loop {
@@ -1313,9 +1348,6 @@ fn handle_raw_input_buffered(lparam: LPARAM) -> Result<()> {
         };
 
         if count == u32::MAX {
-            if total == 0 {
-                return handle_raw_input(lparam);
-            }
             return Err(windows::core::Error::from_thread()).context("GetRawInputBuffer");
         }
 
@@ -1333,21 +1365,7 @@ fn handle_raw_input_buffered(lparam: LPARAM) -> Result<()> {
         }
     }
 
-    if total == 0 {
-        handle_raw_input(lparam)?;
-    }
-
-    let elapsed = started.elapsed();
-    if latency::report(elapsed) {
-        info!(
-            target: "softkvm::latency",
-            packets = total,
-            elapsed_ms = latency::ms(elapsed),
-            "windows buffered raw input drain"
-        );
-    }
-
-    Ok(())
+    Ok(total)
 }
 
 unsafe fn handle_raw_input_buffer_entries(base: *const RAWINPUT, count: u32) -> Result<()> {
@@ -1401,20 +1419,51 @@ unsafe fn read_raw_input(lparam: LPARAM) -> Result<RAWINPUT> {
     Ok(unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<RAWINPUT>()) })
 }
 
+fn fast_direct_motion_writer() -> Option<&'static SharedUdpMotionWriter> {
+    DIRECT_MOTION_FAST.get()
+}
+
 fn handle_mouse(raw: RAWINPUT) -> Result<()> {
     let started = Instant::now();
     let mouse = unsafe { raw.data.mouse };
-    let mut events = Vec::new();
-
-    if mouse.lLastX != 0 || mouse.lLastY != 0 {
-        events.push(InputEvent::MouseMotion {
-            dx: mouse.lLastX,
-            dy: mouse.lLastY,
-        });
-    }
-
     let buttons = unsafe { mouse.Anonymous.Anonymous };
     let flags = u32::from(buttons.usButtonFlags);
+    let dx = mouse.lLastX;
+    let dy = mouse.lLastY;
+
+    if REMOTE_ACTIVE_FAST.load(Ordering::Relaxed) && flags == 0 && (dx != 0 || dy != 0) {
+        if let Some(writer) = fast_direct_motion_writer() {
+            match writer.send_motion_if_confirmed(dx, dy, "raw-fast") {
+                Ok(true) => {
+                    let elapsed = started.elapsed();
+                    if latency::report(elapsed) {
+                        info!(
+                            target: "softkvm::latency",
+                            remote_active = true,
+                            event_count = 1,
+                            elapsed_ms = latency::ms(elapsed),
+                            "windows mouse raw input handling"
+                        );
+                    }
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        "fast direct udp motion send failed; falling back to host state"
+                    );
+                }
+            }
+        }
+    }
+
+    let mut events = Vec::new();
+
+    if dx != 0 || dy != 0 {
+        events.push(InputEvent::MouseMotion { dx, dy });
+    }
+
     push_mouse_button_events(&mut events, flags);
 
     if flags & RI_MOUSE_WHEEL != 0 {
@@ -1439,7 +1488,7 @@ fn handle_mouse(raw: RAWINPUT) -> Result<()> {
     if !state.remote_active
         && state.layout == "mac-left"
         && state.left_edge_armed
-        && mouse.lLastX < 0
+        && dx < 0
         && cursor_at_left_edge()
     {
         let (_, y_ratio) =
@@ -1454,8 +1503,8 @@ fn handle_mouse(raw: RAWINPUT) -> Result<()> {
         let elapsed = started.elapsed();
         info!(
             target: "softkvm::latency",
-            dx = mouse.lLastX,
-            dy = mouse.lLastY,
+            dx,
+            dy,
             y_ratio,
             elapsed_ms = latency::ms(elapsed),
             "windows left-edge activation packet"
@@ -1463,6 +1512,9 @@ fn handle_mouse(raw: RAWINPUT) -> Result<()> {
     }
 
     let event_count = events.len();
+    let has_discrete = events
+        .iter()
+        .any(|event| !matches!(event, InputEvent::MouseMotion { .. }));
     if state.remote_active {
         for event in events {
             if activated_this_packet && let InputEvent::MouseMotion { dx, dy } = event {
@@ -1470,6 +1522,13 @@ fn handle_mouse(raw: RAWINPUT) -> Result<()> {
                 continue;
             }
             if let InputEvent::MouseMotion { dx, dy } = event {
+                if has_discrete {
+                    state.send(HostCommand::InputImmediate(InputEvent::MouseMotion {
+                        dx,
+                        dy,
+                    }))?;
+                    continue;
+                }
                 match state.send_direct_motion(dx, dy) {
                     Ok(true) => continue,
                     Ok(false) => {}

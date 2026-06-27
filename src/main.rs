@@ -31,7 +31,7 @@ const MAC_RIGHT_EDGE_RELEASE_REARM_PX: f64 = 48.0;
 #[cfg(target_os = "macos")]
 const MAC_EDGE_ENTRY_GAP_PX: f64 = 2.0;
 const MAX_MOTION_DELTA_PER_FLUSH: i32 = 512;
-const DEFAULT_MAC_MOTION_FLUSH_INTERVAL_MS: u64 = 2;
+const DEFAULT_MAC_MOTION_FLUSH_INTERVAL_MS: u64 = 1;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -71,15 +71,16 @@ fn build_info() -> Result<()> {
     println!("softkvm {}", env!("CARGO_PKG_VERSION"));
     println!("build_git_hash {}", env!("SOFTKVM_BUILD_GIT_HASH"));
     println!("protocol_version {}", protocol::PROTOCOL_VERSION);
-    println!("motion_transport udp-binary-skm1-with-tcp-fallback");
+    println!("motion_transport default=tcp-json env=SOFTKVM_MOTION_TRANSPORT udp=udp-binary-skm1");
     println!(
         "mac_motion_flush default_ms={} env=SOFTKVM_MAC_MOTION_FLUSH_MS",
         DEFAULT_MAC_MOTION_FLUSH_INTERVAL_MS
     );
-    println!("mac_motion_mode default=cg-event:direct,other:coalesced env=SOFTKVM_MAC_MOTION_MODE");
+    println!("mac_motion_mode default=coalesced env=SOFTKVM_MAC_MOTION_MODE");
     println!("cgevent_pointer_speed default=1.0 env=SOFTKVM_CGEVENT_POINTER_SPEED");
-    println!("cgevent_motion_method default=warp env=SOFTKVM_CGEVENT_MOTION_METHOD");
-    println!("windows_udp_send_mode default=immediate env=SOFTKVM_UDP_SEND_MODE");
+    println!("cgevent_motion_method default=event env=SOFTKVM_CGEVENT_MOTION_METHOD");
+    println!("cgevent_tap default=annotated-session env=SOFTKVM_CGEVENT_TAP");
+    println!("windows_udp_send_mode default=coalesced env=SOFTKVM_UDP_SEND_MODE");
     Ok(())
 }
 
@@ -502,7 +503,10 @@ fn mac_motion_mode(sink: SinkKind) -> MacMotionMode {
             "direct" | "immediate" => MacMotionMode::Direct,
             "coalesced" | "batch" | "timer" => MacMotionMode::Coalesced,
             other => {
-                warn!(value = other, "unknown SOFTKVM_MAC_MOTION_MODE; using default");
+                warn!(
+                    value = other,
+                    "unknown SOFTKVM_MAC_MOTION_MODE; using default"
+                );
                 default_mac_motion_mode(sink)
             }
         };
@@ -511,11 +515,8 @@ fn mac_motion_mode(sink: SinkKind) -> MacMotionMode {
 }
 
 fn default_mac_motion_mode(sink: SinkKind) -> MacMotionMode {
-    if matches!(sink, SinkKind::CgEvent) {
-        MacMotionMode::Direct
-    } else {
-        MacMotionMode::Coalesced
-    }
+    let _ = sink;
+    MacMotionMode::Coalesced
 }
 
 async fn mac_udp_motion_direct_task(
@@ -572,8 +573,12 @@ async fn mac_udp_motion_direct_task(
             continue;
         }
 
-        let dx = packet.dx.clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH);
-        let dy = packet.dy.clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH);
+        let dx = packet
+            .dx
+            .clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH);
+        let dy = packet
+            .dy
+            .clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH);
 
         if right_edge_release_armed && dx > 0 && mac_cursor_at_right_edge() {
             if shared.request_release_once() {
