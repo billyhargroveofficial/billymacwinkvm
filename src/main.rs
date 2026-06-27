@@ -9,7 +9,7 @@ use clap::Parser;
 use cli::{Cli, Command, SinkKind};
 use hid::{HidSink, KarabinerProbe, LogSink};
 use protocol::{
-    ClientControlEvent, Frame, InputEvent, KeyState, Message, MouseButton, ProtocolHello,
+    ClientControlEvent, Frame, InputEvent, KeyCode, KeyState, Message, MouseButton, ProtocolHello,
 };
 use tokio::net::TcpStream;
 use tokio::time::{Duration, sleep};
@@ -28,6 +28,7 @@ async fn main() -> Result<()> {
         Command::GenPsk => gen_psk(),
         Command::MacHidProbe => mac_hid_probe(),
         Command::MacHidSmoke => mac_hid_smoke().await,
+        Command::MacKeySmoke => mac_key_smoke().await,
         Command::Client { listen, sink } => run_client(listen, sink).await,
         Command::Probe { peer } => run_probe(peer).await,
         Command::Host { peer, layout } => run_host(peer, layout).await,
@@ -64,6 +65,23 @@ async fn mac_hid_smoke() -> Result<()> {
             .await?;
         sleep(Duration::from_millis(5)).await;
     }
+    sink.reset().await?;
+    Ok(())
+}
+
+async fn mac_key_smoke() -> Result<()> {
+    let mut sink = hid::karabiner_sink_async().await?;
+    sink.apply(InputEvent::Key {
+        key: KeyCode::Usb(0x04),
+        state: KeyState::Down,
+    })
+    .await?;
+    sleep(Duration::from_millis(30)).await;
+    sink.apply(InputEvent::Key {
+        key: KeyCode::Usb(0x04),
+        state: KeyState::Up,
+    })
+    .await?;
     sink.reset().await?;
     Ok(())
 }
@@ -293,7 +311,7 @@ async fn run_probe(peer: String) -> Result<()> {
                 Message::Input(InputEvent::MouseMotion { dx, dy: 0 }),
             ))
             .await?;
-        sleep(Duration::from_millis(4)).await;
+        tokio::task::yield_now().await;
     }
 
     writer

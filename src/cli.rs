@@ -19,6 +19,9 @@ pub enum Command {
     /// Send a tiny no-click movement through Karabiner VirtualHID.
     MacHidSmoke,
 
+    /// Type a tiny "a" key press through Karabiner VirtualHID.
+    MacKeySmoke,
+
     /// Run the controlled machine receiver.
     Client {
         #[arg(long, default_value = "0.0.0.0:49321")]

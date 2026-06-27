@@ -493,6 +493,15 @@ fn handle_keyboard(raw: RAWINPUT) -> Result<()> {
     }
 
     if state.remote_active {
+        if !events.is_empty() {
+            info!(
+                vkey,
+                make_code,
+                ?key_state,
+                ?events,
+                "sending remote keyboard input"
+            );
+        }
         for event in events {
             state.send(HostCommand::Input(event))?;
         }

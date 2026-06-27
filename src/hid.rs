@@ -160,8 +160,15 @@ impl KarabinerSink {
         let mut keys = [0_u16; 32];
         let mut pressed = self.keys.iter().copied().collect::<Vec<_>>();
         pressed.sort_unstable();
-        for (slot, key) in keys.iter_mut().zip(pressed.into_iter()) {
+        for (slot, key) in keys.iter_mut().zip(pressed.iter().copied()) {
             *slot = key;
+        }
+        if self.modifiers != 0 || !pressed.is_empty() {
+            info!(
+                modifiers = self.modifiers,
+                keys = ?pressed,
+                "posting Karabiner keyboard state"
+            );
         }
         self.client.post_keyboard(self.modifiers, &keys).await
     }
