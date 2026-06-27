@@ -76,9 +76,14 @@ Expected Mac log:
 - `role: "windows-host"`
 - process stays alive
 
+Expected Windows log:
+
+- `persistent Windows keyboard hook is ready for Ctrl+(Alt|Win)+\`
+
 Manual input check:
 
 - Press `Ctrl+Alt+\` to toggle remote mode.
+- If using a Mac keyboard layout on Windows, also test `Ctrl+Win+\`.
 - Or push the pointer into the Windows left edge with `--layout mac-left`.
 - Move the mouse and press harmless keys while watching the Mac log receiver.
 - On the Windows host log, keyboard forwarding should print `sending remote keyboard hook input`.

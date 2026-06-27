@@ -64,6 +64,8 @@ Current host MVP:
 - Parks/clips the Windows cursor while remote control is active.
 - Suppresses local Windows mouse/keyboard input while remote control is active.
 - Restores cursor position by monitor-relative height when crossing back.
+- Keeps a persistent keyboard hook for `Ctrl+(Alt|Win)+\` entry/exit.
+- Flushes mouse motion to macOS every 4 ms instead of sending every raw input packet.
 
 Not implemented yet:
 

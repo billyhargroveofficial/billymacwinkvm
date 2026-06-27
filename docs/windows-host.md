@@ -37,6 +37,8 @@ Implemented in `src/platform/windows.rs`:
 - Cursor parking/clipping while remote macOS control is active.
 - Low-level mouse/keyboard hooks suppress local Windows input while remote macOS control is active.
 - Remote keyboard forwarding from `WH_KEYBOARD_LL`, so the same hook that suppresses Windows input sends key down/up events to macOS.
+- Persistent `WH_KEYBOARD_LL` hotkey hook while host-active, so `Ctrl+(Alt|Win)+\` can enter macOS even when `RegisterHotKey` is blocked by Windows/layout quirks.
+- Mouse motion batching at 4 ms before serialization; key/button/wheel/state messages flush pending motion first.
 
 This is enough to run real Windows-host capture. The next polish area is high-polling mouse smoothness under real LAN load.
 
@@ -58,9 +60,9 @@ RemoteActive:
 
 ## Hotkey
 
-`Ctrl+Alt+\` is `MOD_CONTROL | MOD_ALT | MOD_NOREPEAT` with `VK_OEM_5` on common US-like layouts.
+`Ctrl+Alt+\` is registered as a fallback hotkey with `MOD_CONTROL | MOD_ALT | MOD_NOREPEAT` and `VK_OEM_5` on common US-like layouts.
 
-While `RemoteActive`, the low-level keyboard hook detects `Ctrl+(Alt|Super)+\` and toggles locally. Do not let the chord leak to Windows apps or the Mac.
+The persistent low-level keyboard hook detects `Ctrl+(Alt|Win)+\` in both host-active and remote-active states. Do not let the chord leak to Windows apps or the Mac.
 
 ## Modifier Mapping
 

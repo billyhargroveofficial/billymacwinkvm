@@ -1,12 +1,14 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
+use tokio::time::{Duration, MissedTickBehavior, interval};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -48,8 +50,8 @@ use crate::transport::FrameWriter;
 const HOTKEY_ID_TOGGLE_BACKSLASH: i32 = 1;
 const HOTKEY_ID_TOGGLE_NON_US_BACKSLASH: i32 = 2;
 const EDGE_TRIGGER_PX: i32 = 8;
-const MAX_MOUSE_COALESCE_EVENTS: usize = 1;
-const MAX_MOUSE_COALESCE_DELTA: i32 = 96;
+const HOTKEY_DEBOUNCE_MS: u64 = 250;
+const MOUSE_FLUSH_INTERVAL_MS: u64 = 4;
 const WHEEL_DELTA: i32 = 120;
 const SCANCODE_BACKSLASH: u32 = 0x2b;
 const SCANCODE_NON_US_BACKSLASH: u32 = 0x56;
@@ -82,119 +84,136 @@ async fn writer_task(stream: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Hos
     let mut writer = FrameWriter::new(stream);
     let session_id = Uuid::new_v4();
     let mut seq = 1_u64;
-    let mut pending = VecDeque::new();
 
-    if let Err(err) = writer
-        .write_frame(Frame::new(
-            session_id,
-            seq,
-            Message::Hello(ProtocolHello {
-                protocol_version: crate::protocol::PROTOCOL_VERSION,
-                role: "windows-host".to_owned(),
-                device_name: std::env::var("COMPUTERNAME")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "windows".to_owned()),
-            }),
-        ))
-        .await
+    if !write_host_message(
+        &mut writer,
+        session_id,
+        &mut seq,
+        Message::Hello(ProtocolHello {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
+            role: "windows-host".to_owned(),
+            device_name: std::env::var("COMPUTERNAME")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "windows".to_owned()),
+        }),
+        "host hello failed",
+    )
+    .await
     {
-        error!(?err, "failed to send host hello");
         return;
     }
-    seq += 1;
+
+    let mut pending_dx = 0_i32;
+    let mut pending_dy = 0_i32;
+    let mut flush_timer = interval(Duration::from_millis(MOUSE_FLUSH_INTERVAL_MS));
+    flush_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
-        let Some(command) = next_host_command(&mut rx, &mut pending).await else {
-            break;
-        };
-        let command = coalesce_host_command(command, &mut rx, &mut pending);
-        let message = match command {
-            HostCommand::HostState { active, reason } => Message::HostState(HostStateEvent {
-                remote_active: active,
-                reason: reason.to_owned(),
-                entry_x_ratio: None,
-                entry_y_ratio: None,
-            }),
-            HostCommand::HostStateWithEntry {
-                active,
-                reason,
-                entry_x_ratio,
-                entry_y_ratio,
-            } => Message::HostState(HostStateEvent {
-                remote_active: active,
-                reason: reason.to_owned(),
-                entry_x_ratio: Some(entry_x_ratio),
-                entry_y_ratio: Some(entry_y_ratio),
-            }),
-            HostCommand::Input(event) => Message::Input(event),
-            HostCommand::Reset => Message::InputReset,
-        };
+        tokio::select! {
+            command = rx.recv() => {
+                let Some(command) = command else {
+                    if !flush_pending_motion(&mut writer, session_id, &mut seq, &mut pending_dx, &mut pending_dy).await {
+                        break;
+                    }
+                    break;
+                };
 
-        if let Err(err) = writer
-            .write_frame(Frame::new(session_id, seq, message))
-            .await
-        {
-            error!(?err, "host writer disconnected");
-            release_host_state_after_transport_loss("writer disconnected");
-            break;
-        }
-        seq += 1;
-    }
-}
-
-async fn next_host_command(
-    rx: &mut mpsc::UnboundedReceiver<HostCommand>,
-    pending: &mut VecDeque<HostCommand>,
-) -> Option<HostCommand> {
-    match pending.pop_front() {
-        Some(command) => Some(command),
-        None => rx.recv().await,
-    }
-}
-
-fn coalesce_host_command(
-    command: HostCommand,
-    rx: &mut mpsc::UnboundedReceiver<HostCommand>,
-    pending: &mut VecDeque<HostCommand>,
-) -> HostCommand {
-    let HostCommand::Input(InputEvent::MouseMotion { mut dx, mut dy }) = command else {
-        return command;
-    };
-
-    let mut merged_events = 1_usize;
-    loop {
-        if merged_events >= MAX_MOUSE_COALESCE_EVENTS {
-            break;
-        }
-
-        match rx.try_recv() {
-            Ok(HostCommand::Input(InputEvent::MouseMotion {
-                dx: next_dx,
-                dy: next_dy,
-            })) => {
-                if (dx + next_dx).abs() > MAX_MOUSE_COALESCE_DELTA
-                    || (dy + next_dy).abs() > MAX_MOUSE_COALESCE_DELTA
-                {
-                    pending.push_back(HostCommand::Input(InputEvent::MouseMotion {
-                        dx: next_dx,
-                        dy: next_dy,
-                    }));
+                match command {
+                    HostCommand::Input(InputEvent::MouseMotion { dx, dy }) => {
+                        pending_dx += dx;
+                        pending_dy += dy;
+                    }
+                    other => {
+                        if !flush_pending_motion(&mut writer, session_id, &mut seq, &mut pending_dx, &mut pending_dy).await {
+                            break;
+                        }
+                        if !write_host_message(
+                            &mut writer,
+                            session_id,
+                            &mut seq,
+                            message_from_host_command(other),
+                            "host writer disconnected",
+                        )
+                        .await {
+                            break;
+                        }
+                    }
+                }
+            }
+            _ = flush_timer.tick(), if pending_dx != 0 || pending_dy != 0 => {
+                if !flush_pending_motion(&mut writer, session_id, &mut seq, &mut pending_dx, &mut pending_dy).await {
                     break;
                 }
-                dx += next_dx;
-                dy += next_dy;
-                merged_events += 1;
             }
-            Ok(other) => {
-                pending.push_back(other);
-                break;
-            }
-            Err(_) => break,
         }
     }
+}
 
-    HostCommand::Input(InputEvent::MouseMotion { dx, dy })
+async fn flush_pending_motion(
+    writer: &mut FrameWriter<OwnedWriteHalf>,
+    session_id: Uuid,
+    seq: &mut u64,
+    pending_dx: &mut i32,
+    pending_dy: &mut i32,
+) -> bool {
+    if *pending_dx == 0 && *pending_dy == 0 {
+        return true;
+    }
+
+    let dx = std::mem::take(pending_dx);
+    let dy = std::mem::take(pending_dy);
+    write_host_message(
+        writer,
+        session_id,
+        seq,
+        Message::Input(InputEvent::MouseMotion { dx, dy }),
+        "host writer disconnected",
+    )
+    .await
+}
+
+async fn write_host_message(
+    writer: &mut FrameWriter<OwnedWriteHalf>,
+    session_id: Uuid,
+    seq: &mut u64,
+    message: Message,
+    disconnect_reason: &'static str,
+) -> bool {
+    if let Err(err) = writer
+        .write_frame(Frame::new(session_id, *seq, message))
+        .await
+    {
+        error!(?err, "host writer disconnected");
+        release_host_state_after_transport_loss(disconnect_reason);
+        return false;
+    }
+    *seq += 1;
+    true
+}
+
+fn message_from_host_command(command: HostCommand) -> Message {
+    match command {
+        HostCommand::HostState { active, reason } => Message::HostState(HostStateEvent {
+            remote_active: active,
+            reason: reason.to_owned(),
+            entry_x_ratio: None,
+            entry_y_ratio: None,
+        }),
+        HostCommand::HostStateWithEntry {
+            active,
+            reason,
+            entry_x_ratio,
+            entry_y_ratio,
+        } => Message::HostState(HostStateEvent {
+            remote_active: active,
+            reason: reason.to_owned(),
+            entry_x_ratio: Some(entry_x_ratio),
+            entry_y_ratio: Some(entry_y_ratio),
+        }),
+        HostCommand::Input(event) => Message::Input(event),
+        HostCommand::Reset => Message::InputReset,
+    }
 }
 
 async fn control_reader_task(stream: OwnedReadHalf) {
@@ -243,7 +262,8 @@ async fn control_reader_task(stream: OwnedReadHalf) {
 
 fn run_message_loop() -> Result<()> {
     let hwnd = unsafe { create_message_window()? };
-    let setup = unsafe { register_input(hwnd).and_then(|_| register_hotkey(hwnd)) };
+    let setup = unsafe { register_input(hwnd).and_then(|_| register_hotkey(hwnd)) }
+        .and_then(|_| install_persistent_keyboard_hook());
 
     if let Err(err) = setup {
         unsafe {
@@ -359,11 +379,10 @@ unsafe fn register_hotkey(hwnd: HWND) -> Result<()> {
         }
     }
 
-    if registered {
-        Ok(())
-    } else {
-        bail!("RegisterHotKey Ctrl+Alt+\\ failed for both backslash keys")
+    if !registered {
+        warn!("RegisterHotKey Ctrl+Alt+\\ failed; low-level keyboard hook will handle the hotkey");
     }
+    Ok(())
 }
 
 unsafe fn unregister_hotkeys(hwnd: HWND) {
@@ -384,7 +403,7 @@ unsafe extern "system" fn wnd_proc(
                 HOTKEY_ID_TOGGLE_BACKSLASH | HOTKEY_ID_TOGGLE_NON_US_BACKSLASH
             ) =>
         {
-            if let Err(err) = toggle_remote("hotkey Ctrl+Alt+\\") {
+            if let Err(err) = toggle_remote("hotkey Ctrl+(Alt|Win)+\\") {
                 error!(?err, "toggle failed");
             }
             LRESULT(0)
@@ -538,6 +557,9 @@ fn handle_keyboard(raw: RAWINPUT) -> Result<()> {
 
 fn toggle_remote(reason: &'static str) -> Result<()> {
     let mut state = lock_state()?;
+    if !state.accept_hotkey_toggle() {
+        return Ok(());
+    }
     let active = !state.remote_active;
     state.set_remote_active(active, reason, Some(0.5), Some(0.5))
 }
@@ -595,6 +617,7 @@ unsafe fn cleanup_host_state() {
         && let Ok(mut state) = state.lock()
     {
         state.release_local_controls(true, None, None);
+        state.uninstall_hooks();
         state.remote_active = false;
         return;
     }
@@ -620,6 +643,13 @@ fn release_host_state_after_transport_loss(reason: &'static str) {
             reason, "failed to release local controls after transport loss"
         ),
     }
+}
+
+fn install_persistent_keyboard_hook() -> Result<()> {
+    let mut state = lock_state()?;
+    state.install_keyboard_hook()?;
+    info!("persistent Windows keyboard hook is ready for Ctrl+(Alt|Win)+\\");
+    Ok(())
 }
 
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -649,7 +679,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                     );
                 }
                 if is_backslash_key(key.vkCode as u16, key.scanCode) && ctrl_toggle {
-                    if let Err(err) = toggle_remote("hotkey Ctrl+Alt+\\") {
+                    if let Err(err) = toggle_remote("hotkey Ctrl+(Alt|Win)+\\") {
                         error!(?err, "toggle failed");
                     }
                     return LRESULT(1);
@@ -762,6 +792,7 @@ struct HostState {
     keyboard_hook: Option<isize>,
     saved_cursor_pos: Option<POINT>,
     saved_monitor_rect: Option<RECT>,
+    last_hotkey_toggle: Option<Instant>,
 }
 
 impl HostState {
@@ -776,7 +807,19 @@ impl HostState {
             keyboard_hook: None,
             saved_cursor_pos: None,
             saved_monitor_rect: None,
+            last_hotkey_toggle: None,
         }
+    }
+
+    fn accept_hotkey_toggle(&mut self) -> bool {
+        let now = Instant::now();
+        if self.last_hotkey_toggle.is_some_and(|last| {
+            now.duration_since(last) < Duration::from_millis(HOTKEY_DEBOUNCE_MS)
+        }) {
+            return false;
+        }
+        self.last_hotkey_toggle = Some(now);
+        true
     }
 
     fn set_remote_active(
@@ -890,7 +933,7 @@ impl HostState {
         unsafe {
             release_remote_controls();
         }
-        self.uninstall_hooks();
+        self.uninstall_mouse_hook();
 
         if restore_cursor {
             let target = match (self.saved_monitor_rect, entry_x_ratio.zip(entry_y_ratio)) {
@@ -911,12 +954,20 @@ impl HostState {
     }
 
     fn install_hooks(&mut self) -> Result<()> {
+        self.install_mouse_hook()?;
+        self.install_keyboard_hook()
+    }
+
+    fn install_mouse_hook(&mut self) -> Result<()> {
         if self.mouse_hook.is_none() {
             let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0) }
                 .context("SetWindowsHookExW WH_MOUSE_LL")?;
             self.mouse_hook = Some(hook.0 as isize);
         }
+        Ok(())
+    }
 
+    fn install_keyboard_hook(&mut self) -> Result<()> {
         if self.keyboard_hook.is_none() {
             let hook =
                 unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0) }
@@ -927,13 +978,21 @@ impl HostState {
         Ok(())
     }
 
-    fn uninstall_hooks(&mut self) {
+    fn uninstall_mouse_hook(&mut self) {
         if let Some(hook) = self.mouse_hook.take() {
             uninstall_hook(hook, "WH_MOUSE_LL");
         }
+    }
+
+    fn uninstall_keyboard_hook(&mut self) {
         if let Some(hook) = self.keyboard_hook.take() {
             uninstall_hook(hook, "WH_KEYBOARD_LL");
         }
+    }
+
+    fn uninstall_hooks(&mut self) {
+        self.uninstall_mouse_hook();
+        self.uninstall_keyboard_hook();
     }
 }
 
