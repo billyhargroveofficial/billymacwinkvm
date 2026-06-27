@@ -9,7 +9,7 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, MissedTickBehavior, interval};
-use tracing::{error, info, warn};
+use tracing::{error, info, trace, warn};
 use uuid::Uuid;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -50,8 +50,11 @@ use crate::transport::FrameWriter;
 const HOTKEY_ID_TOGGLE_BACKSLASH: i32 = 1;
 const HOTKEY_ID_TOGGLE_NON_US_BACKSLASH: i32 = 2;
 const EDGE_TRIGGER_PX: i32 = 8;
+const EDGE_REARM_PX: i32 = 64;
 const HOTKEY_DEBOUNCE_MS: u64 = 250;
 const MOUSE_FLUSH_INTERVAL_MS: u64 = 4;
+const MAC_ENTRY_X_RATIO_FROM_WINDOWS: f64 = 0.98;
+const WINDOWS_RESTORE_EDGE_INSET_PX: i32 = 32;
 const WHEEL_DELTA: i32 = 120;
 const SCANCODE_BACKSLASH: u32 = 0x2b;
 const SCANCODE_NON_US_BACKSLASH: u32 = 0x56;
@@ -106,11 +109,37 @@ async fn writer_task(stream: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Hos
 
     let mut pending_dx = 0_i32;
     let mut pending_dy = 0_i32;
+    let mut deferred_command = None;
     let mut flush_timer = interval(Duration::from_millis(MOUSE_FLUSH_INTERVAL_MS));
     flush_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
+        if let Some(command) = deferred_command.take() {
+            if !handle_host_command(
+                command,
+                &mut rx,
+                &mut writer,
+                session_id,
+                &mut seq,
+                &mut pending_dx,
+                &mut pending_dy,
+                &mut deferred_command,
+            )
+            .await
+            {
+                break;
+            }
+            continue;
+        }
+
         tokio::select! {
+            biased;
+
+            _ = flush_timer.tick(), if pending_dx != 0 || pending_dy != 0 => {
+                if !flush_pending_motion(&mut writer, session_id, &mut seq, &mut pending_dx, &mut pending_dy).await {
+                    break;
+                }
+            }
             command = rx.recv() => {
                 let Some(command) = command else {
                     if !flush_pending_motion(&mut writer, session_id, &mut seq, &mut pending_dx, &mut pending_dy).await {
@@ -119,33 +148,64 @@ async fn writer_task(stream: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Hos
                     break;
                 };
 
-                match command {
-                    HostCommand::Input(InputEvent::MouseMotion { dx, dy }) => {
-                        pending_dx += dx;
-                        pending_dy += dy;
-                    }
-                    other => {
-                        if !flush_pending_motion(&mut writer, session_id, &mut seq, &mut pending_dx, &mut pending_dy).await {
-                            break;
-                        }
-                        if !write_host_message(
-                            &mut writer,
-                            session_id,
-                            &mut seq,
-                            message_from_host_command(other),
-                            "host writer disconnected",
-                        )
-                        .await {
-                            break;
-                        }
-                    }
-                }
-            }
-            _ = flush_timer.tick(), if pending_dx != 0 || pending_dy != 0 => {
-                if !flush_pending_motion(&mut writer, session_id, &mut seq, &mut pending_dx, &mut pending_dy).await {
+                if !handle_host_command(
+                    command,
+                    &mut rx,
+                    &mut writer,
+                    session_id,
+                    &mut seq,
+                    &mut pending_dx,
+                    &mut pending_dy,
+                    &mut deferred_command,
+                ).await {
                     break;
                 }
             }
+        }
+    }
+}
+
+async fn handle_host_command(
+    command: HostCommand,
+    rx: &mut mpsc::UnboundedReceiver<HostCommand>,
+    writer: &mut FrameWriter<OwnedWriteHalf>,
+    session_id: Uuid,
+    seq: &mut u64,
+    pending_dx: &mut i32,
+    pending_dy: &mut i32,
+    deferred_command: &mut Option<HostCommand>,
+) -> bool {
+    match command {
+        HostCommand::Input(InputEvent::MouseMotion { dx, dy }) => {
+            *pending_dx = (*pending_dx).saturating_add(dx);
+            *pending_dy = (*pending_dy).saturating_add(dy);
+
+            while let Ok(command) = rx.try_recv() {
+                match command {
+                    HostCommand::Input(InputEvent::MouseMotion { dx, dy }) => {
+                        *pending_dx = (*pending_dx).saturating_add(dx);
+                        *pending_dy = (*pending_dy).saturating_add(dy);
+                    }
+                    other => {
+                        *deferred_command = Some(other);
+                        break;
+                    }
+                }
+            }
+            true
+        }
+        other => {
+            if !flush_pending_motion(writer, session_id, seq, pending_dx, pending_dy).await {
+                return false;
+            }
+            write_host_message(
+                writer,
+                session_id,
+                seq,
+                message_from_host_command(other),
+                "host writer disconnected",
+            )
+            .await
         }
     }
 }
@@ -491,17 +551,33 @@ fn handle_mouse(raw: RAWINPUT) -> Result<()> {
     }
 
     let mut state = lock_state()?;
+    if !state.remote_active && state.layout == "mac-left" {
+        state.update_left_edge_arm();
+    }
+
+    let mut activated_this_packet = false;
     if !state.remote_active
         && state.layout == "mac-left"
+        && state.left_edge_armed
         && mouse.lLastX < 0
         && cursor_at_left_edge()
     {
-        let (_, y_ratio) = current_monitor_cursor_ratios().unwrap_or((0.98, 0.5));
-        state.set_remote_active(true, "left edge", Some(0.98), Some(y_ratio))?;
+        let (_, y_ratio) =
+            current_monitor_cursor_ratios().unwrap_or((MAC_ENTRY_X_RATIO_FROM_WINDOWS, 0.5));
+        state.set_remote_active(
+            true,
+            "left edge",
+            Some(MAC_ENTRY_X_RATIO_FROM_WINDOWS),
+            Some(y_ratio),
+        )?;
+        activated_this_packet = true;
     }
 
     if state.remote_active {
         for event in events {
+            if activated_this_packet && matches!(event, InputEvent::MouseMotion { .. }) {
+                continue;
+            }
             state.send(HostCommand::Input(event))?;
         }
     }
@@ -608,6 +684,17 @@ fn point_from_rect_ratios(rect: RECT, x_ratio: f64, y_ratio: f64) -> POINT {
     }
 }
 
+fn clamp_restore_point_inside_left_edge(rect: RECT, mut point: POINT) -> POINT {
+    let min_x = (rect.left + EDGE_TRIGGER_PX + WINDOWS_RESTORE_EDGE_INSET_PX).min(rect.right - 1);
+    let max_x = rect.right - 1;
+    if max_x >= rect.left {
+        point.x = point.x.clamp(rect.left, max_x).max(min_x);
+    }
+    let max_y = (rect.bottom - 1).max(rect.top);
+    point.y = point.y.clamp(rect.top, max_y);
+    point
+}
+
 unsafe fn release_remote_controls() {
     let _ = unsafe { ClipCursor(None) };
 }
@@ -619,6 +706,7 @@ unsafe fn cleanup_host_state() {
         state.release_local_controls(true, None, None);
         state.uninstall_hooks();
         state.remote_active = false;
+        state.left_edge_armed = false;
         return;
     }
 
@@ -634,6 +722,7 @@ fn release_host_state_after_transport_loss(reason: &'static str) {
                 warn!(reason, "transport lost; releasing local Windows controls");
             }
             state.remote_active = false;
+            state.left_edge_armed = false;
             state.pressed_modifier_keys.clear();
             state.active_modifiers.clear();
             state.release_local_controls(true, None, None);
@@ -672,7 +761,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
             if key_down_message {
                 let ctrl_toggle = ctrl_toggle_modifier_down();
                 if remote_is_active() && ctrl_toggle {
-                    info!(
+                    trace!(
                         vkey = key.vkCode,
                         scan_code = key.scanCode,
                         "remote Ctrl+toggle-modifier keydown"
@@ -717,7 +806,7 @@ fn send_remote_keyboard_from_hook(vkey: u16, scan_code: u32, key_state: KeyState
 
     let events = state.keyboard_events(vkey, key_state);
     if !events.is_empty() {
-        info!(
+        trace!(
             vkey,
             scan_code,
             ?key_state,
@@ -793,6 +882,7 @@ struct HostState {
     saved_cursor_pos: Option<POINT>,
     saved_monitor_rect: Option<RECT>,
     last_hotkey_toggle: Option<Instant>,
+    left_edge_armed: bool,
 }
 
 impl HostState {
@@ -808,6 +898,7 @@ impl HostState {
             saved_cursor_pos: None,
             saved_monitor_rect: None,
             last_hotkey_toggle: None,
+            left_edge_armed: true,
         }
     }
 
@@ -837,22 +928,34 @@ impl HostState {
         self.active_modifiers.clear();
 
         if active {
-            self.capture_local_controls()?;
+            if let Err(err) = self.capture_local_controls() {
+                self.remote_active = false;
+                self.release_local_controls(false, None, None);
+                self.left_edge_armed = false;
+                return Err(err);
+            }
             self.remote_active = true;
-            match entry_x_ratio.zip(entry_y_ratio) {
+            self.left_edge_armed = false;
+            let send_result = match entry_x_ratio.zip(entry_y_ratio) {
                 Some((entry_x_ratio, entry_y_ratio)) => {
                     self.send(HostCommand::HostStateWithEntry {
                         active,
                         reason,
                         entry_x_ratio,
                         entry_y_ratio,
-                    })?;
+                    })
                 }
-                None => self.send(HostCommand::HostState { active, reason })?,
+                None => self.send(HostCommand::HostState { active, reason }),
+            };
+            if let Err(err) = send_result {
+                self.remote_active = false;
+                self.release_local_controls(true, None, None);
+                return Err(err);
             }
             info!(reason, "remote macOS control enabled");
         } else {
             self.remote_active = false;
+            self.left_edge_armed = false;
             self.release_local_controls(true, entry_x_ratio, entry_y_ratio);
             self.send(HostCommand::HostState { active, reason })?;
             self.send(HostCommand::Reset)?;
@@ -916,10 +1019,18 @@ impl HostState {
         });
         self.saved_cursor_pos = Some(cursor);
         self.saved_monitor_rect = monitor_rect_for_point(cursor);
-        self.install_hooks()?;
+        if let Err(err) = self.install_hooks() {
+            self.uninstall_mouse_hook();
+            return Err(err);
+        }
         unsafe {
-            clip_cursor_to_point(cursor)?;
-            SetCursorPos(cursor.x, cursor.y).context("SetCursorPos freeze")?;
+            if let Err(err) = clip_cursor_to_point(cursor)
+                .and_then(|_| SetCursorPos(cursor.x, cursor.y).context("SetCursorPos freeze"))
+            {
+                release_remote_controls();
+                self.uninstall_mouse_hook();
+                return Err(err);
+            }
         }
         Ok(())
     }
@@ -938,8 +1049,14 @@ impl HostState {
         if restore_cursor {
             let target = match (self.saved_monitor_rect, entry_x_ratio.zip(entry_y_ratio)) {
                 (Some(rect), Some((x_ratio, y_ratio))) => {
-                    Some(point_from_rect_ratios(rect, x_ratio, y_ratio))
+                    Some(clamp_restore_point_inside_left_edge(
+                        rect,
+                        point_from_rect_ratios(rect, x_ratio, y_ratio),
+                    ))
                 }
+                (Some(rect), None) => self
+                    .saved_cursor_pos
+                    .map(|point| clamp_restore_point_inside_left_edge(rect, point)),
                 _ => self.saved_cursor_pos,
             };
 
@@ -951,6 +1068,18 @@ impl HostState {
         }
         self.saved_cursor_pos = None;
         self.saved_monitor_rect = None;
+    }
+
+    fn update_left_edge_arm(&mut self) {
+        if self.left_edge_armed {
+            return;
+        }
+        if let Ok(point) = current_cursor_position() {
+            let virtual_left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+            if point.x > virtual_left + EDGE_TRIGGER_PX + EDGE_REARM_PX {
+                self.left_edge_armed = true;
+            }
+        }
     }
 
     fn install_hooks(&mut self) -> Result<()> {

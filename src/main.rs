@@ -13,10 +13,17 @@ use protocol::{
     ProtocolHello,
 };
 use std::collections::HashSet;
-use tokio::net::TcpStream;
-use tokio::time::{Duration, sleep};
-use tracing::{info, warn};
+use tokio::net::{
+    TcpStream,
+    tcp::{OwnedReadHalf, OwnedWriteHalf},
+};
+use tokio::sync::mpsc;
+use tokio::time::{Duration, MissedTickBehavior, interval, sleep};
+use tracing::{info, trace, warn};
 use uuid::Uuid;
+
+const MAC_MOTION_FLUSH_INTERVAL_MS: u64 = 4;
+const MAC_RIGHT_EDGE_RELEASE_REARM_PX: f64 = 96.0;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -109,97 +116,138 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
         }
 
         let (read_half, write_half) = stream.into_split();
-        let mut reader = transport::FrameReader::new(read_half);
         let mut writer = transport::FrameWriter::new(write_half);
+        let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
+        tokio::spawn(client_reader_task(read_half, frame_tx));
         let mut client_state = ClientRuntimeState::default();
         let client_session_id = Uuid::new_v4();
         let mut client_seq = 1_u64;
         let mut saw_frame = false;
         let mut touched_input = false;
+        let mut pending_motion = PendingMotion::default();
+        let mut flush_timer = interval(Duration::from_millis(MAC_MOTION_FLUSH_INTERVAL_MS));
+        flush_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut read_error = None;
 
-        while let Some(frame) = reader.read_frame().await? {
-            saw_frame = true;
-            match frame.message {
-                Message::Hello(hello) => {
-                    info!(?hello, "host hello");
+        loop {
+            tokio::select! {
+                biased;
+
+                _ = flush_timer.tick(), if pending_motion.has_motion() => {
+                    flush_client_motion(
+                        &mut hid_sink,
+                        sink,
+                        &mut writer,
+                        client_session_id,
+                        &mut client_seq,
+                        &mut client_state,
+                        &mut pending_motion,
+                    ).await;
                 }
-                Message::HostState(state) => {
-                    info!(?state, "host state");
-                    client_state.remote_active = state.remote_active;
-                    client_state.reset_keys();
-                    if state.remote_active {
-                        position_mac_cursor(state.entry_x_ratio, state.entry_y_ratio);
-                    } else {
-                        reset_input(&mut hid_sink, sink).await;
-                    }
-                }
-                Message::ClientControl(control) => {
-                    info!(?control, "client control from peer ignored");
-                }
-                Message::Input(event) => {
-                    touched_input = true;
-                    if client_state.should_release_for_hotkey(&event) {
-                        client_state.remote_active = false;
-                        reset_input(&mut hid_sink, sink).await;
-                        if let Err(err) = writer
-                            .write_frame(Frame::new(
-                                client_session_id,
-                                client_seq,
-                                Message::ClientControl(ClientControlEvent::ReleaseHost {
-                                    reason: "remote hotkey Ctrl+Alt+\\".to_owned(),
-                                    entry_x_ratio: Some(0.5),
-                                    entry_y_ratio: Some(0.5),
-                                }),
-                            ))
-                            .await
-                        {
-                            warn!(?err, "failed to request host release from hotkey");
-                        } else {
-                            client_seq += 1;
-                            info!("requested Windows host release from remote hotkey");
+                event = frame_rx.recv() => {
+                    let Some(event) = event else {
+                        break;
+                    };
+
+                    let frame = match event {
+                        ClientReadEvent::Frame(frame) => frame,
+                        ClientReadEvent::Disconnected => break,
+                        ClientReadEvent::Failed(err) => {
+                            read_error = Some(err);
+                            break;
                         }
-                        continue;
-                    }
-                    let check_right_edge = client_state.should_check_right_edge_release(&event);
-                    apply_input(&mut hid_sink, sink, event).await;
-                    if check_right_edge && mac_cursor_at_right_edge() {
-                        client_state.remote_active = false;
-                        reset_input(&mut hid_sink, sink).await;
-                        let (_, y_ratio) = mac_cursor_ratios().unwrap_or((0.0, 0.5));
-                        if let Err(err) = writer
-                            .write_frame(Frame::new(
+                    };
+
+                    saw_frame = true;
+                    match frame.message {
+                        Message::Hello(hello) => {
+                            info!(?hello, "host hello");
+                        }
+                        Message::HostState(state) => {
+                            pending_motion.clear();
+                            info!(?state, "host state");
+                            client_state.set_remote_active(state.remote_active);
+                            if state.remote_active {
+                                position_mac_cursor(state.entry_x_ratio, state.entry_y_ratio);
+                            } else {
+                                reset_input(&mut hid_sink, sink).await;
+                            }
+                        }
+                        Message::ClientControl(control) => {
+                            info!(?control, "client control from peer ignored");
+                        }
+                        Message::Input(event) => {
+                            touched_input = true;
+
+                            if !client_state.remote_active {
+                                continue;
+                            }
+
+                            if let InputEvent::MouseMotion { dx, dy } = event {
+                                pending_motion.add(dx, dy);
+                                continue;
+                            }
+
+                            flush_client_motion(
+                                &mut hid_sink,
+                                sink,
+                                &mut writer,
                                 client_session_id,
-                                client_seq,
-                                Message::ClientControl(ClientControlEvent::ReleaseHost {
-                                    reason: "mac right edge".to_owned(),
-                                    entry_x_ratio: Some(0.02),
-                                    entry_y_ratio: Some(y_ratio),
-                                }),
-                            ))
-                            .await
-                        {
-                            warn!(?err, "failed to request host release");
-                        } else {
-                            client_seq += 1;
-                            info!("requested Windows host release from macOS right edge");
+                                &mut client_seq,
+                                &mut client_state,
+                                &mut pending_motion,
+                            ).await;
+
+                            if client_state.should_release_for_hotkey(&event) {
+                                request_host_release(
+                                    &mut hid_sink,
+                                    sink,
+                                    &mut writer,
+                                    client_session_id,
+                                    &mut client_seq,
+                                    &mut client_state,
+                                    "remote hotkey Ctrl+Alt+\\",
+                                    Some(0.5),
+                                    Some(0.5),
+                                ).await;
+                                continue;
+                            }
+
+                            apply_input(&mut hid_sink, sink, event).await;
+                            client_state.update_right_edge_release_arm();
+                        }
+                        Message::InputReset => {
+                            touched_input = true;
+                            pending_motion.clear();
+                            client_state.reset_keys();
+                            reset_input(&mut hid_sink, sink).await;
+                        }
+                        Message::Heartbeat { monotonic_ms } => {
+                            trace!(monotonic_ms, "heartbeat");
                         }
                     }
-                }
-                Message::InputReset => {
-                    touched_input = true;
-                    client_state.reset_keys();
-                    reset_input(&mut hid_sink, sink).await;
-                }
-                Message::Heartbeat { monotonic_ms } => {
-                    info!(monotonic_ms, "heartbeat");
                 }
             }
         }
+
+        flush_client_motion(
+            &mut hid_sink,
+            sink,
+            &mut writer,
+            client_session_id,
+            &mut client_seq,
+            &mut client_state,
+            &mut pending_motion,
+        )
+        .await;
 
         if saw_frame {
             warn!(%addr, "host disconnected");
         } else {
             info!(%addr, "empty tcp probe disconnected");
+        }
+        if let Some(err) = read_error {
+            warn!(?err, "host read loop failed");
         }
 
         if touched_input {
@@ -208,13 +256,163 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
     }
 }
 
+enum ClientReadEvent {
+    Frame(Frame),
+    Disconnected,
+    Failed(anyhow::Error),
+}
+
+async fn client_reader_task(read_half: OwnedReadHalf, tx: mpsc::UnboundedSender<ClientReadEvent>) {
+    let mut reader = transport::FrameReader::new(read_half);
+    loop {
+        match reader.read_frame().await {
+            Ok(Some(frame)) => {
+                if tx.send(ClientReadEvent::Frame(frame)).is_err() {
+                    break;
+                }
+            }
+            Ok(None) => {
+                let _ = tx.send(ClientReadEvent::Disconnected);
+                break;
+            }
+            Err(err) => {
+                let _ = tx.send(ClientReadEvent::Failed(err));
+                break;
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct PendingMotion {
+    dx: i32,
+    dy: i32,
+}
+
+impl PendingMotion {
+    fn add(&mut self, dx: i32, dy: i32) {
+        self.dx = self.dx.saturating_add(dx);
+        self.dy = self.dy.saturating_add(dy);
+    }
+
+    fn clear(&mut self) {
+        self.dx = 0;
+        self.dy = 0;
+    }
+
+    fn has_motion(&self) -> bool {
+        self.dx != 0 || self.dy != 0
+    }
+
+    fn take(&mut self) -> Option<(i32, i32)> {
+        if !self.has_motion() {
+            return None;
+        }
+        Some((std::mem::take(&mut self.dx), std::mem::take(&mut self.dy)))
+    }
+}
+
+async fn flush_client_motion(
+    hid_sink: &mut Box<dyn HidSink>,
+    sink: SinkKind,
+    writer: &mut transport::FrameWriter<OwnedWriteHalf>,
+    client_session_id: Uuid,
+    client_seq: &mut u64,
+    client_state: &mut ClientRuntimeState,
+    pending_motion: &mut PendingMotion,
+) {
+    let Some((dx, dy)) = pending_motion.take() else {
+        return;
+    };
+    if !client_state.remote_active {
+        return;
+    }
+
+    if client_state.should_release_before_motion(dx) && mac_cursor_at_right_edge() {
+        let (_, y_ratio) = mac_cursor_ratios().unwrap_or((0.0, 0.5));
+        request_host_release(
+            hid_sink,
+            sink,
+            writer,
+            client_session_id,
+            client_seq,
+            client_state,
+            "mac right edge",
+            Some(0.02),
+            Some(y_ratio),
+        )
+        .await;
+        return;
+    }
+
+    apply_input(hid_sink, sink, InputEvent::MouseMotion { dx, dy }).await;
+    client_state.update_right_edge_release_arm();
+
+    if client_state.should_release_after_motion(dx) && mac_cursor_at_right_edge() {
+        let (_, y_ratio) = mac_cursor_ratios().unwrap_or((0.0, 0.5));
+        request_host_release(
+            hid_sink,
+            sink,
+            writer,
+            client_session_id,
+            client_seq,
+            client_state,
+            "mac right edge",
+            Some(0.02),
+            Some(y_ratio),
+        )
+        .await;
+    }
+}
+
+async fn request_host_release(
+    hid_sink: &mut Box<dyn HidSink>,
+    sink: SinkKind,
+    writer: &mut transport::FrameWriter<OwnedWriteHalf>,
+    client_session_id: Uuid,
+    client_seq: &mut u64,
+    client_state: &mut ClientRuntimeState,
+    reason: &'static str,
+    entry_x_ratio: Option<f64>,
+    entry_y_ratio: Option<f64>,
+) {
+    client_state.set_remote_active(false);
+
+    if let Err(err) = writer
+        .write_frame(Frame::new(
+            client_session_id,
+            *client_seq,
+            Message::ClientControl(ClientControlEvent::ReleaseHost {
+                reason: reason.to_owned(),
+                entry_x_ratio,
+                entry_y_ratio,
+            }),
+        ))
+        .await
+    {
+        warn!(?err, reason, "failed to request host release");
+    } else {
+        *client_seq += 1;
+        info!(reason, "requested Windows host release");
+    }
+
+    reset_input(hid_sink, sink).await;
+}
+
 #[derive(Default)]
 struct ClientRuntimeState {
     remote_active: bool,
     active_modifiers: HashSet<Modifier>,
+    right_edge_release_armed: bool,
 }
 
 impl ClientRuntimeState {
+    fn set_remote_active(&mut self, active: bool) {
+        self.remote_active = active;
+        self.reset_keys();
+        self.right_edge_release_armed = false;
+    }
+
     fn reset_keys(&mut self) {
         self.active_modifiers.clear();
     }
@@ -244,8 +442,21 @@ impl ClientRuntimeState {
         }
     }
 
-    fn should_check_right_edge_release(&self, event: &InputEvent) -> bool {
-        matches!(event, InputEvent::MouseMotion { dx, .. } if self.remote_active && *dx > 0)
+    fn update_right_edge_release_arm(&mut self) {
+        if !self.remote_active || self.right_edge_release_armed {
+            return;
+        }
+        if mac_cursor_right_gap().is_some_and(|gap| gap >= MAC_RIGHT_EDGE_RELEASE_REARM_PX) {
+            self.right_edge_release_armed = true;
+        }
+    }
+
+    fn should_release_before_motion(&self, dx: i32) -> bool {
+        self.remote_active && self.right_edge_release_armed && dx > 0
+    }
+
+    fn should_release_after_motion(&self, dx: i32) -> bool {
+        self.remote_active && self.right_edge_release_armed && dx > 0
     }
 }
 
@@ -264,6 +475,12 @@ fn mac_cursor_at_right_edge() -> bool {
         Some((cursor, bounds)) => cursor.x >= bounds.origin.x + bounds.size.width - EDGE_TRIGGER_PX,
         None => false,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_cursor_right_gap() -> Option<f64> {
+    let (cursor, bounds) = unsafe { mac_cursor_and_main_display_bounds()? };
+    Some((bounds.origin.x + bounds.size.width - cursor.x).max(0.0))
 }
 
 #[cfg(target_os = "macos")]
@@ -297,6 +514,11 @@ fn position_mac_cursor(_x_ratio: Option<f64>, _y_ratio: Option<f64>) {}
 #[cfg(not(target_os = "macos"))]
 fn mac_cursor_at_right_edge() -> bool {
     false
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mac_cursor_right_gap() -> Option<f64> {
+    None
 }
 
 #[cfg(target_os = "macos")]

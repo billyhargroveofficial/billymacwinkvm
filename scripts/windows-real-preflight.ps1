@@ -11,7 +11,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
-$env:RUST_LOG = if ($env:RUST_LOG) { $env:RUST_LOG } else { "info" }
+$env:RUST_LOG = if ($env:RUST_LOG) { $env:RUST_LOG } else { "softkvm=info" }
 
 if (!(Test-Path $Exe)) {
   throw "softkvm executable not found: $Exe"

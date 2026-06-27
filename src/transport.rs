@@ -63,14 +63,11 @@ where
         if body.len() > MAX_FRAME_BYTES {
             bail!("frame too large: {}", body.len());
         }
-        self.stream
-            .write_all(&(body.len() as u32).to_le_bytes())
-            .await
-            .context("write frame length")?;
-        self.stream
-            .write_all(&body)
-            .await
-            .context("write frame body")?;
+
+        let mut wire = Vec::with_capacity(4 + body.len());
+        wire.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        wire.extend_from_slice(&body);
+        self.stream.write_all(&wire).await.context("write frame")?;
         self.stream.flush().await.context("flush frame")?;
         Ok(())
     }

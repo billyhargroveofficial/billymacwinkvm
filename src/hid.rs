@@ -18,6 +18,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{Duration, sleep};
 use tracing::info;
 #[cfg(unix)]
+use tracing::trace;
+#[cfg(unix)]
 use tracing::warn;
 
 use crate::protocol::InputEvent;
@@ -150,15 +152,16 @@ impl KarabinerSink {
         let mut vertical_wheel = vertical_wheel;
         let mut horizontal_wheel = horizontal_wheel;
 
+        let mut reports = Vec::new();
         while dx != 0 || dy != 0 || vertical_wheel != 0 || horizontal_wheel != 0 {
             let x = take_i8_chunk(&mut dx);
             let y = take_i8_chunk(&mut dy);
             let v = take_i8_chunk(&mut vertical_wheel);
             let h = take_i8_chunk(&mut horizontal_wheel);
-            self.client.post_pointing(self.buttons, x, y, v, h).await?;
+            reports.push((self.buttons, x, y, v, h));
         }
 
-        Ok(())
+        self.client.post_pointing_reports(&reports).await
     }
 
     async fn post_keyboard_state(&mut self) -> Result<()> {
@@ -169,7 +172,7 @@ impl KarabinerSink {
             *slot = key;
         }
         if self.modifiers != 0 || !pressed.is_empty() {
-            info!(
+            trace!(
                 modifiers = self.modifiers,
                 keys = ?pressed,
                 "posting Karabiner keyboard state"
@@ -377,7 +380,32 @@ impl KarabinerClient {
             .await
     }
 
+    async fn post_pointing_reports(&mut self, reports: &[(u32, i8, i8, i8, i8)]) -> Result<()> {
+        if reports.is_empty() {
+            return Ok(());
+        }
+
+        let mut bodies = Vec::with_capacity(reports.len());
+        for &(buttons, x, y, vertical_wheel, horizontal_wheel) in reports {
+            let mut payload = Vec::with_capacity(8);
+            payload.extend_from_slice(&buttons.to_le_bytes());
+            payload.push(x as u8);
+            payload.push(y as u8);
+            payload.push(vertical_wheel as u8);
+            payload.push(horizontal_wheel as u8);
+            debug_assert_eq!(payload.len(), 8);
+            bodies.push(self.request_body(KarabinerRequest::PostPointingInputReport, &payload));
+        }
+
+        self.write_request_bodies(bodies).await
+    }
+
     async fn request(&mut self, request: KarabinerRequest, payload: &[u8]) -> Result<()> {
+        let body = self.request_body(request, payload);
+        self.write_request_bodies(vec![body]).await
+    }
+
+    fn request_body(&mut self, request: KarabinerRequest, payload: &[u8]) -> Vec<u8> {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
 
@@ -390,9 +418,19 @@ impl KarabinerClient {
         body.push(4); // pqrs::unix_domain_stream::message_type::request
         body.extend_from_slice(&request_id.to_be_bytes());
         body.extend_from_slice(&karabiner_payload);
+        body
+    }
 
+    async fn write_request_bodies(&self, bodies: Vec<Vec<u8>>) -> Result<()> {
+        let mut wire = Vec::new();
+        for body in bodies {
+            let len = u32::try_from(body.len()).context("Karabiner frame too large")?;
+            wire.extend_from_slice(&len.to_be_bytes());
+            wire.extend_from_slice(&body);
+        }
         let mut writer = self.writer.lock().await;
-        write_karabiner_body(&mut *writer, &body).await
+        writer.write_all(&wire).await?;
+        Ok(())
     }
 }
 
@@ -515,9 +553,10 @@ where
     W: AsyncWrite + Unpin,
 {
     let len = u32::try_from(body.len()).context("Karabiner frame too large")?;
-    writer.write_all(&len.to_be_bytes()).await?;
-    writer.write_all(body).await?;
-    writer.flush().await?;
+    let mut wire = Vec::with_capacity(4 + body.len());
+    wire.extend_from_slice(&len.to_be_bytes());
+    wire.extend_from_slice(body);
+    writer.write_all(&wire).await?;
     Ok(())
 }
 
