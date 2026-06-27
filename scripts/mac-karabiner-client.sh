@@ -13,7 +13,7 @@ if [[ ! -S "$SOCKET" ]]; then
 fi
 
 cargo build
-cargo run -- mac-hid-probe
+sudo "$ROOT/target/debug/softkvm" mac-hid-probe
 
 echo
 echo "Starting real macOS input receiver through Karabiner VirtualHID."

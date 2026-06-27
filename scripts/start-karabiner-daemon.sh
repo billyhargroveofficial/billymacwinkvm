@@ -10,15 +10,17 @@ if [[ ! -x "$DAEMON" ]]; then
   exit 1
 fi
 
+sudo -v
+
 if pgrep -f 'Karabiner-VirtualHIDDevice-Daemon' >/dev/null; then
   echo "daemon already running"
 else
   echo "starting daemon with sudo..."
-  sudo nohup "$DAEMON" >"$LOG" 2>&1 &
+  sudo /bin/sh -c 'nohup "$1" >"$2" 2>&1 < /dev/null &' sh "$DAEMON" "$LOG"
 fi
 
 for _ in {1..30}; do
-  if [[ -S "$SOCKET" ]]; then
+  if sudo test -S "$SOCKET"; then
     echo "socket ready: $SOCKET"
     exit 0
   fi

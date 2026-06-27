@@ -13,13 +13,15 @@ pgrep -afil 'Karabiner|VirtualHID|pqrs' || true
 
 echo
 echo "== Socket =="
-if [[ -S "$SOCKET" ]]; then
-  ls -la "$SOCKET"
+if sudo -n test -S "$SOCKET" 2>/dev/null; then
+  sudo -n ls -la "$SOCKET"
 else
-  echo "missing: $SOCKET"
+  echo "missing or not readable without sudo: $SOCKET"
+  echo "run ./scripts/start-karabiner-daemon.sh to verify with sudo"
 fi
 
 echo
 echo "== softkvm probe =="
 cd "$ROOT"
-cargo run -- mac-hid-probe || true
+cargo build
+sudo -n target/debug/softkvm mac-hid-probe || true
