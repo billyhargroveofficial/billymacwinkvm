@@ -18,4 +18,4 @@ cargo run -- mac-hid-probe
 echo
 echo "Starting real macOS input receiver through Karabiner VirtualHID."
 echo "Leave this terminal open. Stop with Ctrl+C."
-RUST_LOG="${RUST_LOG:-info}" target/debug/softkvm client --listen "0.0.0.0:$PORT" --sink karabiner
+sudo env RUST_LOG="${RUST_LOG:-info}" "$ROOT/target/debug/softkvm" client --listen "0.0.0.0:$PORT" --sink karabiner
