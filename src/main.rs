@@ -23,7 +23,8 @@ use tracing::{info, trace, warn};
 use uuid::Uuid;
 
 const MAC_MOTION_FLUSH_INTERVAL_MS: u64 = 4;
-const MAC_RIGHT_EDGE_RELEASE_REARM_PX: f64 = 96.0;
+const MAC_RIGHT_EDGE_RELEASE_REARM_PX: f64 = 48.0;
+const MAX_MOTION_DELTA_PER_FLUSH: i32 = 512;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -128,67 +129,79 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
         let mut flush_timer = interval(Duration::from_millis(MAC_MOTION_FLUSH_INTERVAL_MS));
         flush_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut read_error = None;
+        let mut deferred_read_event = None;
 
         loop {
-            tokio::select! {
-                biased;
+            let event = if let Some(event) = deferred_read_event.take() {
+                Some(event)
+            } else {
+                tokio::select! {
+                    biased;
 
-                _ = flush_timer.tick(), if pending_motion.has_motion() => {
-                    flush_client_motion(
-                        &mut hid_sink,
-                        sink,
-                        &mut writer,
-                        client_session_id,
-                        &mut client_seq,
-                        &mut client_state,
-                        &mut pending_motion,
-                    ).await;
+                    _ = flush_timer.tick(), if pending_motion.has_motion() => {
+                        let _ = flush_client_motion(
+                            &mut hid_sink,
+                            sink,
+                            &mut writer,
+                            client_session_id,
+                            &mut client_seq,
+                            &mut client_state,
+                            &mut pending_motion,
+                        ).await;
+                        flush_timer.reset();
+                        continue;
+                    }
+                    event = frame_rx.recv() => event,
                 }
-                event = frame_rx.recv() => {
-                    let Some(event) = event else {
-                        break;
-                    };
+            };
 
-                    let frame = match event {
-                        ClientReadEvent::Frame(frame) => frame,
-                        ClientReadEvent::Disconnected => break,
-                        ClientReadEvent::Failed(err) => {
-                            read_error = Some(err);
-                            break;
-                        }
-                    };
+            let Some(event) = event else {
+                break;
+            };
 
-                    saw_frame = true;
-                    match frame.message {
-                        Message::Hello(hello) => {
-                            info!(?hello, "host hello");
-                        }
-                        Message::HostState(state) => {
-                            pending_motion.clear();
-                            info!(?state, "host state");
-                            client_state.set_remote_active(state.remote_active);
-                            if state.remote_active {
-                                position_mac_cursor(state.entry_x_ratio, state.entry_y_ratio);
-                            } else {
-                                reset_input(&mut hid_sink, sink).await;
-                            }
-                        }
-                        Message::ClientControl(control) => {
-                            info!(?control, "client control from peer ignored");
-                        }
-                        Message::Input(event) => {
-                            touched_input = true;
+            let frame = match event {
+                ClientReadEvent::Frame(frame) => frame,
+                ClientReadEvent::Disconnected => break,
+                ClientReadEvent::Failed(err) => {
+                    read_error = Some(err);
+                    break;
+                }
+            };
 
-                            if !client_state.remote_active {
-                                continue;
-                            }
+            saw_frame = true;
+            match frame.message {
+                Message::Hello(hello) => {
+                    info!(?hello, "host hello");
+                }
+                Message::HostState(state) => {
+                    pending_motion.clear();
+                    info!(?state, "host state");
+                    client_state.set_remote_active(state.remote_active);
+                    if state.remote_active {
+                        position_mac_cursor(state.entry_x_ratio, state.entry_y_ratio);
+                    } else {
+                        reset_input(&mut hid_sink, sink).await;
+                    }
+                }
+                Message::ClientControl(control) => {
+                    info!(?control, "client control from peer ignored");
+                }
+                Message::Input(event) => {
+                    touched_input = true;
 
-                            if let InputEvent::MouseMotion { dx, dy } = event {
-                                pending_motion.add(dx, dy);
-                                continue;
-                            }
+                    if !client_state.remote_active {
+                        continue;
+                    }
 
-                            flush_client_motion(
+                    if let InputEvent::MouseMotion { dx, dy } = event {
+                        pending_motion.add(dx, dy);
+                        drain_queued_motion(
+                            &mut frame_rx,
+                            &mut pending_motion,
+                            &mut deferred_read_event,
+                        );
+                        if client_state.take_just_activated() {
+                            let _ = flush_client_motion(
                                 &mut hid_sink,
                                 sink,
                                 &mut writer,
@@ -196,36 +209,54 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
                                 &mut client_seq,
                                 &mut client_state,
                                 &mut pending_motion,
-                            ).await;
-
-                            if client_state.should_release_for_hotkey(&event) {
-                                request_host_release(
-                                    &mut hid_sink,
-                                    sink,
-                                    &mut writer,
-                                    client_session_id,
-                                    &mut client_seq,
-                                    &mut client_state,
-                                    "remote hotkey Ctrl+Alt+\\",
-                                    Some(0.5),
-                                    Some(0.5),
-                                ).await;
-                                continue;
-                            }
-
-                            apply_input(&mut hid_sink, sink, event).await;
-                            client_state.update_right_edge_release_arm();
+                            )
+                            .await;
                         }
-                        Message::InputReset => {
-                            touched_input = true;
-                            pending_motion.clear();
-                            client_state.reset_keys();
-                            reset_input(&mut hid_sink, sink).await;
-                        }
-                        Message::Heartbeat { monotonic_ms } => {
-                            trace!(monotonic_ms, "heartbeat");
-                        }
+                        flush_timer.reset();
+                        continue;
                     }
+
+                    if flush_client_motion(
+                        &mut hid_sink,
+                        sink,
+                        &mut writer,
+                        client_session_id,
+                        &mut client_seq,
+                        &mut client_state,
+                        &mut pending_motion,
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+
+                    if client_state.should_release_for_hotkey(&event) {
+                        request_host_release(
+                            &mut hid_sink,
+                            sink,
+                            &mut writer,
+                            client_session_id,
+                            &mut client_seq,
+                            &mut client_state,
+                            "remote hotkey Ctrl+Alt+\\",
+                            Some(0.5),
+                            Some(0.5),
+                        )
+                        .await;
+                        continue;
+                    }
+
+                    apply_input(&mut hid_sink, sink, event).await;
+                    client_state.update_right_edge_release_arm();
+                }
+                Message::InputReset => {
+                    touched_input = true;
+                    pending_motion.clear();
+                    client_state.reset_keys();
+                    reset_input(&mut hid_sink, sink).await;
+                }
+                Message::Heartbeat { monotonic_ms } => {
+                    trace!(monotonic_ms, "heartbeat");
                 }
             }
         }
@@ -283,6 +314,25 @@ async fn client_reader_task(read_half: OwnedReadHalf, tx: mpsc::UnboundedSender<
     }
 }
 
+fn drain_queued_motion(
+    frame_rx: &mut mpsc::UnboundedReceiver<ClientReadEvent>,
+    pending_motion: &mut PendingMotion,
+    deferred_read_event: &mut Option<ClientReadEvent>,
+) {
+    while let Ok(event) = frame_rx.try_recv() {
+        match event {
+            ClientReadEvent::Frame(Frame {
+                message: Message::Input(InputEvent::MouseMotion { dx, dy }),
+                ..
+            }) => pending_motion.add(dx, dy),
+            other => {
+                *deferred_read_event = Some(other);
+                break;
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct PendingMotion {
     dx: i32,
@@ -308,7 +358,12 @@ impl PendingMotion {
         if !self.has_motion() {
             return None;
         }
-        Some((std::mem::take(&mut self.dx), std::mem::take(&mut self.dy)))
+        Some((
+            std::mem::take(&mut self.dx)
+                .clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH),
+            std::mem::take(&mut self.dy)
+                .clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH),
+        ))
     }
 }
 
@@ -320,12 +375,12 @@ async fn flush_client_motion(
     client_seq: &mut u64,
     client_state: &mut ClientRuntimeState,
     pending_motion: &mut PendingMotion,
-) {
+) -> bool {
     let Some((dx, dy)) = pending_motion.take() else {
-        return;
+        return false;
     };
     if !client_state.remote_active {
-        return;
+        return false;
     }
 
     if client_state.should_release_before_motion(dx) && mac_cursor_at_right_edge() {
@@ -342,7 +397,7 @@ async fn flush_client_motion(
             Some(y_ratio),
         )
         .await;
-        return;
+        return true;
     }
 
     apply_input(hid_sink, sink, InputEvent::MouseMotion { dx, dy }).await;
@@ -362,7 +417,10 @@ async fn flush_client_motion(
             Some(y_ratio),
         )
         .await;
+        return true;
     }
+
+    false
 }
 
 async fn request_host_release(
@@ -404,6 +462,7 @@ struct ClientRuntimeState {
     remote_active: bool,
     active_modifiers: HashSet<Modifier>,
     right_edge_release_armed: bool,
+    just_activated: bool,
 }
 
 impl ClientRuntimeState {
@@ -411,6 +470,7 @@ impl ClientRuntimeState {
         self.remote_active = active;
         self.reset_keys();
         self.right_edge_release_armed = false;
+        self.just_activated = active;
     }
 
     fn reset_keys(&mut self) {
@@ -457,6 +517,10 @@ impl ClientRuntimeState {
 
     fn should_release_after_motion(&self, dx: i32) -> bool {
         self.remote_active && self.right_edge_release_armed && dx > 0
+    }
+
+    fn take_just_activated(&mut self) -> bool {
+        std::mem::take(&mut self.just_activated)
     }
 }
 

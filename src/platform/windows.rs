@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -53,6 +54,8 @@ const EDGE_TRIGGER_PX: i32 = 8;
 const EDGE_REARM_PX: i32 = 64;
 const HOTKEY_DEBOUNCE_MS: u64 = 250;
 const MOUSE_FLUSH_INTERVAL_MS: u64 = 4;
+const MAX_MOTION_DRAIN_PER_TURN: usize = 64;
+const MAX_MOTION_DELTA_PER_FLUSH: i32 = 512;
 const MAC_ENTRY_X_RATIO_FROM_WINDOWS: f64 = 0.98;
 const WINDOWS_RESTORE_EDGE_INSET_PX: i32 = 32;
 const WHEEL_DELTA: i32 = 120;
@@ -60,6 +63,7 @@ const SCANCODE_BACKSLASH: u32 = 0x2b;
 const SCANCODE_NON_US_BACKSLASH: u32 = 0x56;
 
 static HOST_STATE: OnceLock<Mutex<HostState>> = OnceLock::new();
+static REMOTE_ACTIVE_FAST: AtomicBool = AtomicBool::new(false);
 
 pub async fn run_host(peer: String, layout: String) -> Result<()> {
     if layout != "mac-left" {
@@ -80,7 +84,10 @@ pub async fn run_host(peer: String, layout: String) -> Result<()> {
     tokio::spawn(control_reader_task(read_half));
 
     info!(%peer, %layout, "starting Windows host capture");
-    run_message_loop().context("run Windows host message loop")
+    tokio::task::spawn_blocking(run_message_loop)
+        .await
+        .context("join Windows host message loop")?
+        .context("run Windows host message loop")
 }
 
 async fn writer_task(stream: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<HostCommand>) {
@@ -180,7 +187,10 @@ async fn handle_host_command(
             *pending_dx = (*pending_dx).saturating_add(dx);
             *pending_dy = (*pending_dy).saturating_add(dy);
 
-            while let Ok(command) = rx.try_recv() {
+            for _ in 0..MAX_MOTION_DRAIN_PER_TURN {
+                let Ok(command) = rx.try_recv() else {
+                    break;
+                };
                 match command {
                     HostCommand::Input(InputEvent::MouseMotion { dx, dy }) => {
                         *pending_dx = (*pending_dx).saturating_add(dx);
@@ -193,6 +203,19 @@ async fn handle_host_command(
                 }
             }
             true
+        }
+        HostCommand::InputImmediate(event) => {
+            if !flush_pending_motion(writer, session_id, seq, pending_dx, pending_dy).await {
+                return false;
+            }
+            write_host_message(
+                writer,
+                session_id,
+                seq,
+                Message::Input(event),
+                "host writer disconnected",
+            )
+            .await
         }
         other => {
             if !flush_pending_motion(writer, session_id, seq, pending_dx, pending_dy).await {
@@ -221,8 +244,10 @@ async fn flush_pending_motion(
         return true;
     }
 
-    let dx = std::mem::take(pending_dx);
-    let dy = std::mem::take(pending_dy);
+    let dx =
+        std::mem::take(pending_dx).clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH);
+    let dy =
+        std::mem::take(pending_dy).clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH);
     write_host_message(
         writer,
         session_id,
@@ -271,7 +296,7 @@ fn message_from_host_command(command: HostCommand) -> Message {
             entry_x_ratio: Some(entry_x_ratio),
             entry_y_ratio: Some(entry_y_ratio),
         }),
-        HostCommand::Input(event) => Message::Input(event),
+        HostCommand::Input(event) | HostCommand::InputImmediate(event) => Message::Input(event),
         HostCommand::Reset => Message::InputReset,
     }
 }
@@ -575,7 +600,8 @@ fn handle_mouse(raw: RAWINPUT) -> Result<()> {
 
     if state.remote_active {
         for event in events {
-            if activated_this_packet && matches!(event, InputEvent::MouseMotion { .. }) {
+            if activated_this_packet && let InputEvent::MouseMotion { dx, dy } = event {
+                state.send(HostCommand::InputImmediate(clamp_activation_motion(dx, dy)))?;
                 continue;
             }
             state.send(HostCommand::Input(event))?;
@@ -583,6 +609,13 @@ fn handle_mouse(raw: RAWINPUT) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn clamp_activation_motion(dx: i32, dy: i32) -> InputEvent {
+    InputEvent::MouseMotion {
+        dx: dx.clamp(-64, 0),
+        dy: dy.clamp(-64, 64),
+    }
 }
 
 fn push_mouse_button_events(events: &mut Vec<InputEvent>, flags: u32) {
@@ -706,6 +739,7 @@ unsafe fn cleanup_host_state() {
         state.release_local_controls(true, None, None);
         state.uninstall_hooks();
         state.remote_active = false;
+        REMOTE_ACTIVE_FAST.store(false, Ordering::Relaxed);
         state.left_edge_armed = false;
         return;
     }
@@ -722,6 +756,7 @@ fn release_host_state_after_transport_loss(reason: &'static str) {
                 warn!(reason, "transport lost; releasing local Windows controls");
             }
             state.remote_active = false;
+            REMOTE_ACTIVE_FAST.store(false, Ordering::Relaxed);
             state.left_edge_armed = false;
             state.pressed_modifier_keys.clear();
             state.active_modifiers.clear();
@@ -742,7 +777,7 @@ fn install_persistent_keyboard_hook() -> Result<()> {
 }
 
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code == HC_ACTION as i32 && remote_is_active() {
+    if code == HC_ACTION as i32 && REMOTE_ACTIVE_FAST.load(Ordering::Relaxed) {
         return LRESULT(1);
     }
 
@@ -868,6 +903,7 @@ enum HostCommand {
         entry_y_ratio: f64,
     },
     Input(InputEvent),
+    InputImmediate(InputEvent),
     Reset,
 }
 
@@ -930,11 +966,13 @@ impl HostState {
         if active {
             if let Err(err) = self.capture_local_controls() {
                 self.remote_active = false;
+                REMOTE_ACTIVE_FAST.store(false, Ordering::Relaxed);
                 self.release_local_controls(false, None, None);
                 self.left_edge_armed = false;
                 return Err(err);
             }
             self.remote_active = true;
+            REMOTE_ACTIVE_FAST.store(true, Ordering::Relaxed);
             self.left_edge_armed = false;
             let send_result = match entry_x_ratio.zip(entry_y_ratio) {
                 Some((entry_x_ratio, entry_y_ratio)) => {
@@ -949,12 +987,14 @@ impl HostState {
             };
             if let Err(err) = send_result {
                 self.remote_active = false;
+                REMOTE_ACTIVE_FAST.store(false, Ordering::Relaxed);
                 self.release_local_controls(true, None, None);
                 return Err(err);
             }
             info!(reason, "remote macOS control enabled");
         } else {
             self.remote_active = false;
+            REMOTE_ACTIVE_FAST.store(false, Ordering::Relaxed);
             self.left_edge_armed = false;
             self.release_local_controls(true, entry_x_ratio, entry_y_ratio);
             self.send(HostCommand::HostState { active, reason })?;
@@ -1024,9 +1064,7 @@ impl HostState {
             return Err(err);
         }
         unsafe {
-            if let Err(err) = clip_cursor_to_point(cursor)
-                .and_then(|_| SetCursorPos(cursor.x, cursor.y).context("SetCursorPos freeze"))
-            {
+            if let Err(err) = clip_cursor_to_parking_box(cursor) {
                 release_remote_controls();
                 self.uninstall_mouse_hook();
                 return Err(err);
@@ -1131,14 +1169,14 @@ fn current_cursor_position() -> Result<POINT> {
     Ok(point)
 }
 
-unsafe fn clip_cursor_to_point(point: POINT) -> Result<()> {
+unsafe fn clip_cursor_to_parking_box(point: POINT) -> Result<()> {
     let rect = RECT {
         left: point.x,
-        top: point.y,
-        right: point.x + 1,
-        bottom: point.y + 1,
+        top: point.y - EDGE_TRIGGER_PX,
+        right: point.x + EDGE_TRIGGER_PX + 1,
+        bottom: point.y + EDGE_TRIGGER_PX + 1,
     };
-    unsafe { ClipCursor(Some(&rect)).context("ClipCursor saved cursor point") }
+    unsafe { ClipCursor(Some(&rect)).context("ClipCursor parking box") }
 }
 
 fn uninstall_hook(handle: isize, name: &'static str) {
