@@ -152,15 +152,18 @@ pub async fn cgevent_sink_async() -> Result<Box<dyn HidSink>> {
 
 #[cfg(target_os = "macos")]
 pub fn cgevent_note_cursor_position(x: f64, y: f64) {
+    let point = CgEventSink::clamp_to_main_display(CGPoint { x, y });
     if let Ok(mut position) = CGEVENT_CURSOR_POSITION.lock() {
-        *position = Some(CGPoint { x, y });
+        *position = Some(point);
     }
 }
 
 #[cfg(target_os = "macos")]
 pub fn cgevent_cached_cursor_position() -> Option<(f64, f64)> {
-    let position = CGEVENT_CURSOR_POSITION.lock().ok()?;
-    position.map(|point| (point.x, point.y))
+    let mut position = CGEVENT_CURSOR_POSITION.lock().ok()?;
+    let point = CgEventSink::clamp_to_main_display((*position)?);
+    *position = Some(point);
+    Some((point.x, point.y))
 }
 
 #[cfg(target_os = "macos")]
@@ -234,9 +237,11 @@ impl CgEventSink {
     fn cached_position() -> Option<CGPoint> {
         let mut cached = CGEVENT_CURSOR_POSITION.lock().ok()?;
         if let Some(point) = *cached {
+            let point = Self::clamp_to_main_display(point);
+            *cached = Some(point);
             return Some(point);
         }
-        let point = Self::read_current_position()?;
+        let point = Self::clamp_to_main_display(Self::read_current_position()?);
         *cached = Some(point);
         Some(point)
     }
@@ -256,8 +261,33 @@ impl CgEventSink {
             x: current.x + f64::from(dx) * speed,
             y: current.y + f64::from(dy) * speed,
         };
+        let point = Self::clamp_to_main_display(point);
         *cached = Some(point);
         Some(point)
+    }
+
+    fn clamp_to_main_display(point: CGPoint) -> CGPoint {
+        let bounds = unsafe { CGDisplayBounds(CGMainDisplayID()) };
+        let min_x = bounds.origin.x;
+        let max_x = bounds.origin.x + bounds.size.width - 1.0;
+        let min_y = bounds.origin.y;
+        let max_y = bounds.origin.y + bounds.size.height - 1.0;
+        let clamped = CGPoint {
+            x: point.x.clamp(min_x, max_x),
+            y: point.y.clamp(min_y, max_y),
+        };
+        if (clamped.x - point.x).abs() > f64::EPSILON
+            || (clamped.y - point.y).abs() > f64::EPSILON
+        {
+            warn!(
+                x = point.x,
+                y = point.y,
+                clamped_x = clamped.x,
+                clamped_y = clamped.y,
+                "clamped CGEvent cursor position to main display"
+            );
+        }
+        clamped
     }
 
     fn post_motion(&self, dx: i32, dy: i32) -> Result<()> {
@@ -287,6 +317,7 @@ impl CgEventSink {
         if status != 0 {
             bail!("CGWarpMouseCursorPosition failed: {status}");
         }
+        cgevent_note_cursor_position(point.x, point.y);
         if latency::report(elapsed) {
             info!(
                 target: "softkvm::latency",
@@ -715,6 +746,22 @@ struct CGPoint {
 }
 
 #[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGSize {
+    width: f64,
+    height: f64,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGRect {
+    origin: CGPoint,
+    size: CGSize,
+}
+
+#[cfg(target_os = "macos")]
 const CG_HID_EVENT_TAP: u32 = 0;
 #[cfg(target_os = "macos")]
 const CG_SESSION_EVENT_TAP: u32 = 1;
@@ -760,6 +807,8 @@ const CG_EVENT_FLAG_MASK_COMMAND: u64 = 0x0010_0000;
 #[cfg(target_os = "macos")]
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
+    fn CGMainDisplayID() -> u32;
+    fn CGDisplayBounds(display: u32) -> CGRect;
     fn CGEventCreate(source: *const std::ffi::c_void) -> *mut std::ffi::c_void;
     fn CGEventGetLocation(event: *mut std::ffi::c_void) -> CGPoint;
     fn CGEventCreateMouseEvent(
