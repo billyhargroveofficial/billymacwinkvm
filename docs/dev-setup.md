@@ -26,12 +26,6 @@ Run the Windows ARM smoke test through Parallels:
 ./scripts/parallels-probe.sh
 ```
 
-Check Karabiner VirtualHID presence:
-
-```bash
-cargo run -- mac-hid-probe
-```
-
 Keep ShareMouse off while testing:
 
 ```bash

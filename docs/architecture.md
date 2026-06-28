@@ -13,7 +13,7 @@ Hard requirements:
 - Edge transfer from Windows left edge into macOS, and macOS right edge back to Windows.
 - Toggle/escape hotkey: `Ctrl+Alt+\`.
 - Default macOS modifier profile uses PC physical order: Windows `Alt` -> macOS `Command`, Windows `Super/Win` -> macOS `Option`; `SOFTKVM_MAC_MODIFIER_POLICY=native` enables semantic Mac labels.
-- The macOS side should use a virtual HID mouse/keyboard so device-tuning tools such as LinearMouse and Scroll Reverser can see it.
+- The macOS side currently uses CGEvent injection because it had the lowest activation latency in local testing.
 - Reliable reconnect after sleep/wake.
 - Startup at login.
 
@@ -24,9 +24,8 @@ Windows physical devices
   -> softkvm host, Win32 Raw Input
   -> split local transport
   -> softkvm macOS client
-  -> Karabiner VirtualHID / DriverKit virtual HID
+  -> CGEvent injection
   -> macOS input stack
-  -> LinearMouse / Scroll Reverser
 ```
 
 ## Latency Model
@@ -58,14 +57,11 @@ For 200 Hz displays:
 
 ## MVP Order
 
-1. Prove macOS virtual HID device exists and is visible to LinearMouse.
-2. Build macOS client against the virtual HID path.
-3. Add dev transport and synthetic `probe` sender.
-4. Build Windows Raw Input host.
-5. Replace dev TCP/JSON mouse motion with a binary UDP motion plane.
-6. Add startup installers and rollback commands.
-
-Do not spend serious time on Windows capture until the macOS virtual HID proof is green.
+1. Keep the CGEvent macOS receiver stable and measurable.
+2. Add dev transport and synthetic `probe` sender.
+3. Build Windows Raw Input host.
+4. Keep the binary UDP motion plane as an opt-in A/B path.
+5. Add startup installers and rollback commands.
 
 ## Input State
 

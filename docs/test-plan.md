@@ -158,7 +158,7 @@ Read the `raw_gap_ms` lines first:
 - If `raw-only` is clean but `hooks-passive` or `hooks-suppress` is bad, the
   low-level mouse hook/suppression path is the primary suspect.
 - If all three are clean, keep looking downstream: UDP/network, Mac scheduling,
-  Karabiner, or visible cursor/compositor.
+  CGEvent posting, or visible cursor/compositor.
 
 On the Mac, start a log receiver:
 
@@ -184,12 +184,11 @@ Expected Mac log:
 
 Then run the real host:
 
-On the Mac, switch from the log receiver to the real receiver. It defaults to
-`cg-event`; use `SOFTKVM_MAC_SINK=karabiner` only for the VirtualHID A/B path:
+On the Mac, switch from the log receiver to the real receiver:
 
 ```bash
 cd /Users/billy/repos/billymacwinkvm
-./scripts/mac-karabiner-client.sh
+./scripts/mac-cgevent-client.sh
 ```
 
 On Windows:

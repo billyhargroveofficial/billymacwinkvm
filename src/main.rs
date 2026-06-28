@@ -8,7 +8,7 @@ mod transport;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use cli::{BenchTiming, BenchTransport, Cli, Command, SinkKind, WinRawCadenceMode};
-use hid::{HidSink, KarabinerProbe, LogSink};
+use hid::{HidSink, LogSink};
 use protocol::{
     ClientControlEvent, Frame, InputEvent, KeyCode, KeyState, MOTION_DATAGRAM_LEN, Message,
     Modifier, MotionDatagram, MouseButton, ProtocolHello,
@@ -48,10 +48,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::BuildInfo => build_info(),
         Command::GenPsk => gen_psk(),
-        Command::MacHidProbe => mac_hid_probe(),
         Command::MacNativeHidProbe => mac_native_hid_probe().await,
-        Command::MacHidSmoke => mac_hid_smoke().await,
-        Command::MacKeySmoke => mac_key_smoke().await,
         Command::Client { listen, sink } => run_client(listen, sink).await,
         Command::Probe { peer } => run_probe(peer).await,
         Command::MotionBench {
@@ -108,19 +105,6 @@ fn gen_psk() -> Result<()> {
     Ok(())
 }
 
-fn mac_hid_probe() -> Result<()> {
-    let probe = KarabinerProbe::detect();
-    println!("{}", serde_json::to_string_pretty(&probe)?);
-
-    if !probe.ready {
-        bail!(
-            "Karabiner VirtualHID is not ready. Install/approve the system extension, then rerun this probe."
-        );
-    }
-
-    Ok(())
-}
-
 async fn mac_native_hid_probe() -> Result<()> {
     let mut sink = hid::native_hid_sink_async().await?;
     info!("native macOS virtual HID opened; sending no-click smoke movement");
@@ -135,42 +119,6 @@ async fn mac_native_hid_probe() -> Result<()> {
     }
     sink.reset().await?;
     println!("native_hid_ready true");
-    Ok(())
-}
-
-async fn mac_hid_smoke() -> Result<()> {
-    let mut sink = hid::karabiner_sink_async().await?;
-    for _ in 0..30 {
-        sink.apply(InputEvent::MouseMotion { dx: 8, dy: 0 }).await?;
-        sleep(Duration::from_millis(5)).await;
-    }
-    for _ in 0..30 {
-        sink.apply(InputEvent::MouseMotion { dx: -8, dy: 0 })
-            .await?;
-        sleep(Duration::from_millis(5)).await;
-    }
-    sink.reset().await?;
-    Ok(())
-}
-
-async fn mac_key_smoke() -> Result<()> {
-    let mut sink = hid::karabiner_sink_async().await?;
-    info!("typing five synthetic 'a' key presses through Karabiner VirtualHID");
-    for _ in 0..5 {
-        sink.apply(InputEvent::Key {
-            key: KeyCode::Usb(0x04),
-            state: KeyState::Down,
-        })
-        .await?;
-        sleep(Duration::from_millis(90)).await;
-        sink.apply(InputEvent::Key {
-            key: KeyCode::Usb(0x04),
-            state: KeyState::Up,
-        })
-        .await?;
-        sleep(Duration::from_millis(70)).await;
-    }
-    sink.reset().await?;
     Ok(())
 }
 
@@ -1028,7 +976,6 @@ impl ClientRuntimeState {
 async fn make_sink(sink: SinkKind) -> Result<Box<dyn HidSink>> {
     match sink {
         SinkKind::Log => Ok(Box::new(LogSink::default())),
-        SinkKind::Karabiner => hid::karabiner_sink_async().await,
         SinkKind::NativeHid => hid::native_hid_sink_async().await,
         SinkKind::CgEvent => hid::cgevent_sink_async().await,
     }

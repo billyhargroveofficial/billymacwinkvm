@@ -9,7 +9,7 @@ Primary goal:
 - Mouse/keyboard should cross the screen edge.
 - `Ctrl+Alt+\` is the emergency/toggle hotkey.
 - While controlling macOS, Windows `Alt` maps to macOS `Command`, and Windows `Win/Super` maps to macOS `Option`.
-- macOS injection currently defaults to `cg-event` for lowest observed entry latency; Karabiner DriverKit VirtualHID remains available with `SOFTKVM_MAC_SINK=karabiner`.
+- macOS injection uses `cg-event`; the old external virtual-HID path was removed after it added visible activation lag.
 
 ## Current Status
 
@@ -17,7 +17,6 @@ The repo currently contains:
 
 - Rust CLI scaffold.
 - Protocol-only `client` and `probe` commands.
-- Karabiner VirtualHID wire-format encoder.
 - Windows Raw Input host MVP with `Ctrl+Alt+\` toggle and `mac-left` edge activation.
 - Motion transport defaults to TCP coalescing for better tail-latency; binary UDP `SKM1` remains available with `SOFTKVM_MOTION_TRANSPORT=udp`.
 - Native macOS `IOHIDUserDevice` probe/backend scaffold; current unsigned dev build fails without Apple's `com.apple.developer.hid.virtual.device` entitlement.
@@ -27,19 +26,12 @@ Still missing for the final "feels native on a 200 Hz monitor" version:
 
 - Real startup installers for macOS launchd and Windows Task Scheduler.
 
-## Mac Check
-
-```bash
-./scripts/check-mac-vhid.sh
-```
-
 ## Dev Commands
 
 ```bash
 cargo build
 cargo test
 ./scripts/test-local.sh
-cargo run -- mac-hid-probe
 cargo run -- mac-native-hid-probe
 cargo run -- client --listen 127.0.0.1:49321 --sink log
 cargo run -- probe --peer 127.0.0.1:49321
@@ -47,7 +39,7 @@ cargo run -- probe --peer 127.0.0.1:49321
 ./scripts/parallels-host-smoke.sh
 ./scripts/test-parallels.sh
 ./scripts/mac-log-client.sh
-./scripts/mac-karabiner-client.sh
+./scripts/mac-cgevent-client.sh
 ```
 
 Real Windows preflight:
@@ -69,14 +61,13 @@ macOS receiver coalesces high-rate mouse deltas before posting input.
 Default flush interval is `1ms`; for real-machine tuning:
 
 ```bash
-SOFTKVM_MAC_MOTION_FLUSH_MS=1 ./scripts/mac-karabiner-client.sh
-SOFTKVM_MAC_MOTION_FLUSH_MS=4 ./scripts/mac-karabiner-client.sh
+SOFTKVM_MAC_MOTION_FLUSH_MS=1 ./scripts/mac-cgevent-client.sh
+SOFTKVM_MAC_MOTION_FLUSH_MS=4 ./scripts/mac-cgevent-client.sh
 ```
 
 ## Docs
 
 - `docs/architecture.md`
-- `docs/mac-virtual-hid.md`
 - `docs/windows-host.md`
 - `docs/dev-setup.md`
 - `docs/test-plan.md`

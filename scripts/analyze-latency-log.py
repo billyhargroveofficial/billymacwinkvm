@@ -226,8 +226,6 @@ def analyze(path: Path):
             series["mac_cgevent_warp"].append((ts, line_no))
         if "cgevent mouse post latency" in line:
             series["mac_cgevent_mouse_post"].append((ts, line_no))
-        if "Karabiner write latency" in line:
-            series["karabiner_write"].append((ts, line_no))
         if "windows udp motion send latency" in line:
             series["windows_udp_send"].append((ts, line_no))
         if "windows motion flush batch" in line:
@@ -258,8 +256,6 @@ def analyze(path: Path):
                     label = f"mac_cgevent_mouse_post_{key}"
                 elif "mac input sink apply latency" in line and key == "elapsed_ms":
                     label = "mac_input_apply_ms"
-                elif "Karabiner write latency" in line:
-                    label = f"karabiner_{key}"
                 elif "windows udp motion send latency" in line and key == "elapsed_ms":
                     label = "windows_udp_send_ms"
                 elif "windows tcp write latency" in line and key == "elapsed_ms":

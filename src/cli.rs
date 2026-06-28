@@ -16,17 +16,8 @@ pub enum Command {
     /// Generate a 256-bit pairing key for later authenticated transports.
     GenPsk,
 
-    /// Check whether Karabiner VirtualHID is present on macOS.
-    MacHidProbe,
-
     /// Try to create our own native macOS virtual HID device.
     MacNativeHidProbe,
-
-    /// Send a tiny no-click movement through Karabiner VirtualHID.
-    MacHidSmoke,
-
-    /// Type a tiny "a" key press through Karabiner VirtualHID.
-    MacKeySmoke,
 
     /// Run the controlled machine receiver.
     Client {
@@ -98,7 +89,6 @@ pub enum Command {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum SinkKind {
     Log,
-    Karabiner,
     NativeHid,
     CgEvent,
 }
