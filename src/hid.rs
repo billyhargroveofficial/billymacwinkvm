@@ -276,8 +276,7 @@ impl CgEventSink {
             x: point.x.clamp(min_x, max_x),
             y: point.y.clamp(min_y, max_y),
         };
-        if (clamped.x - point.x).abs() > f64::EPSILON
-            || (clamped.y - point.y).abs() > f64::EPSILON
+        if (clamped.x - point.x).abs() > f64::EPSILON || (clamped.y - point.y).abs() > f64::EPSILON
         {
             warn!(
                 x = point.x,

@@ -13,8 +13,12 @@ MAC_MOTION_FLUSH_MS="${SOFTKVM_MAC_MOTION_FLUSH_MS:-1}"
 CGEVENT_MOTION_METHOD="${SOFTKVM_CGEVENT_MOTION_METHOD:-event}"
 CGEVENT_TAP="${SOFTKVM_CGEVENT_TAP:-annotated-session}"
 CGEVENT_POINTER_SPEED="${SOFTKVM_CGEVENT_POINTER_SPEED:-1.0}"
+MAC_RIGHT_EDGE_RELEASE="${SOFTKVM_MAC_RIGHT_EDGE_RELEASE:-0}"
 MOTION_TRANSPORT="${SOFTKVM_MOTION_TRANSPORT:-tcp}"
 UDP_SEND_MODE="${SOFTKVM_UDP_SEND_MODE:-coalesced}"
+WIN_ACTIVATE_ON_START="${SOFTKVM_WIN_ACTIVATE_ON_START:-1}"
+WIN_ENTRY_X_RATIO="${SOFTKVM_WIN_ENTRY_X_RATIO:-0.5}"
+WIN_ENTRY_Y_RATIO="${SOFTKVM_WIN_ENTRY_Y_RATIO:-0.5}"
 LATENCY_LOG="${SOFTKVM_LATENCY_LOG:-1}"
 LATENCY_WARN_MS="${SOFTKVM_LATENCY_WARN_MS:-1}"
 MAC_RUST_LOG="${SOFTKVM_MAC_RUST_LOG:-softkvm=info,softkvm::latency=info}"
@@ -52,6 +56,7 @@ Environment knobs:
   SOFTKVM_MAC_PARALLELS_IP="$MAC_PARALLELS_IP"
   SOFTKVM_MOTION_TRANSPORT="$MOTION_TRANSPORT"
   SOFTKVM_MAC_SINK="$SINK"
+  SOFTKVM_MAC_RIGHT_EDGE_RELEASE="$MAC_RIGHT_EDGE_RELEASE"
 EOF
 }
 
@@ -166,9 +171,10 @@ SOFTKVM_INTERACTIVE_OUT="$OUT_DIR" SOFTKVM_PORT="$PORT" ./scripts/parallels-inte
 cd "$ROOT"
 SOFTKVM_INTERACTIVE_OUT="$OUT_DIR" SOFTKVM_PORT="$PORT" ./scripts/parallels-interactive-test.sh win
 
-3. Click inside the Parallels Windows window. With capture-on, the cursor should
-   stay inside the VM until Parallels releases it. Push to the left VM edge or
-   press Ctrl+Alt+\\ to enter macOS remote mode.
+3. VM mode starts remote macOS control immediately in the center of the Mac
+   display. Do not test the left edge inside Parallels; Parallels re-injects
+   the pointer into Windows and creates a host/guest edge loop. Use Ctrl+Alt+\\
+   to return from macOS remote mode during VM testing.
 
 4. Stop Windows host:
 
@@ -212,6 +218,7 @@ run_mac() {
     SOFTKVM_CGEVENT_MOTION_METHOD="$CGEVENT_MOTION_METHOD" \
     SOFTKVM_CGEVENT_TAP="$CGEVENT_TAP" \
     SOFTKVM_CGEVENT_POINTER_SPEED="$CGEVENT_POINTER_SPEED" \
+    SOFTKVM_MAC_RIGHT_EDGE_RELEASE="$MAC_RIGHT_EDGE_RELEASE" \
     "$ROOT/target/debug/softkvm" client --listen "0.0.0.0:$PORT" --sink "$SINK" \
     2>&1 | tee "$MAC_LOG"
 }
@@ -243,6 +250,9 @@ Remove-Item -Force \$out,\$err -ErrorAction SilentlyContinue; \
 \$env:SOFTKVM_MOTION_TRANSPORT = '$MOTION_TRANSPORT'
 \$env:SOFTKVM_UDP_SEND_MODE = '$UDP_SEND_MODE'
 \$softkvmArgs = @('host', '--peer', '${MAC_PARALLELS_IP}:$PORT', '--layout', '$LAYOUT')
+if ('$WIN_ACTIVATE_ON_START' -ne '0') {
+    \$softkvmArgs += @('--activate-on-start', '--entry-x-ratio', '$WIN_ENTRY_X_RATIO', '--entry-y-ratio', '$WIN_ENTRY_Y_RATIO')
+}
 & \$exe @softkvmArgs > \$out 2> \$err
 '@ | Set-Content -Path \$script -Encoding UTF8; \
 Write-Output ('wrote ' + \$script)"

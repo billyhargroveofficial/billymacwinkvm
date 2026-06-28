@@ -63,7 +63,22 @@ async fn main() -> Result<()> {
             dx,
         } => run_motion_bench(peer, transport, timing, hz, seconds, dx).await,
         Command::WinRawCadence { seconds, mode } => run_win_raw_cadence(seconds, mode),
-        Command::Host { peer, layout } => run_host(peer, layout).await,
+        Command::Host {
+            peer,
+            layout,
+            activate_on_start,
+            entry_x_ratio,
+            entry_y_ratio,
+        } => {
+            run_host(
+                peer,
+                layout,
+                activate_on_start,
+                entry_x_ratio,
+                entry_y_ratio,
+            )
+            .await
+        }
     }
 }
 
@@ -81,6 +96,7 @@ fn build_info() -> Result<()> {
     println!("cgevent_motion_method default=event env=SOFTKVM_CGEVENT_MOTION_METHOD");
     println!("cgevent_tap default=annotated-session env=SOFTKVM_CGEVENT_TAP");
     println!("windows_udp_send_mode default=coalesced env=SOFTKVM_UDP_SEND_MODE");
+    println!("mac_right_edge_release default=on env=SOFTKVM_MAC_RIGHT_EDGE_RELEASE");
     Ok(())
 }
 
@@ -225,6 +241,9 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
 
             let (frame, read_at) = match event {
                 ClientEvent::Motion(MacMotionEvent::ReleaseHost { entry_y_ratio }) => {
+                    if !mac_right_edge_release_enabled() {
+                        continue;
+                    }
                     if !client_state.remote_active {
                         continue;
                     }
@@ -519,6 +538,17 @@ fn default_mac_motion_mode(sink: SinkKind) -> MacMotionMode {
     MacMotionMode::Coalesced
 }
 
+fn mac_right_edge_release_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("SOFTKVM_MAC_RIGHT_EDGE_RELEASE") {
+        Ok(value) => !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no" | "disabled"
+        ),
+        Err(_) => true,
+    })
+}
+
 async fn mac_udp_motion_direct_task(
     socket: UdpSocket,
     mut motion_sink: Box<dyn HidSink>,
@@ -580,7 +610,11 @@ async fn mac_udp_motion_direct_task(
             .dy
             .clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH);
 
-        if right_edge_release_armed && dx > 0 && mac_cursor_at_right_edge() {
+        if mac_right_edge_release_enabled()
+            && right_edge_release_armed
+            && dx > 0
+            && mac_cursor_at_right_edge()
+        {
             if shared.request_release_once() {
                 let (_, y_ratio) = mac_cursor_ratios().unwrap_or((0.0, 0.5));
                 let _ = event_tx.send(MacMotionEvent::ReleaseHost {
@@ -610,7 +644,11 @@ async fn mac_udp_motion_direct_task(
             right_edge_release_armed = true;
         }
 
-        if right_edge_release_armed && dx > 0 && mac_cursor_at_right_edge() {
+        if mac_right_edge_release_enabled()
+            && right_edge_release_armed
+            && dx > 0
+            && mac_cursor_at_right_edge()
+        {
             if shared.request_release_once() {
                 let (_, y_ratio) = mac_cursor_ratios().unwrap_or((0.0, 0.5));
                 let _ = event_tx.send(MacMotionEvent::ReleaseHost {
@@ -668,7 +706,11 @@ async fn mac_motion_writer_task(
             continue;
         };
 
-        if right_edge_release_armed && dx > 0 && mac_cursor_at_right_edge() {
+        if mac_right_edge_release_enabled()
+            && right_edge_release_armed
+            && dx > 0
+            && mac_cursor_at_right_edge()
+        {
             if shared.request_release_once() {
                 let (_, y_ratio) = mac_cursor_ratios().unwrap_or((0.0, 0.5));
                 let _ = event_tx.send(MacMotionEvent::ReleaseHost {
@@ -698,7 +740,11 @@ async fn mac_motion_writer_task(
             right_edge_release_armed = true;
         }
 
-        if right_edge_release_armed && dx > 0 && mac_cursor_at_right_edge() {
+        if mac_right_edge_release_enabled()
+            && right_edge_release_armed
+            && dx > 0
+            && mac_cursor_at_right_edge()
+        {
             if shared.request_release_once() {
                 let (_, y_ratio) = mac_cursor_ratios().unwrap_or((0.0, 0.5));
                 let _ = event_tx.send(MacMotionEvent::ReleaseHost {
@@ -727,7 +773,10 @@ async fn handle_client_motion(
     let dx = dx.clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH);
     let dy = dy.clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH);
 
-    if client_state.should_release_before_motion(dx) && mac_cursor_at_right_edge() {
+    if mac_right_edge_release_enabled()
+        && client_state.should_release_before_motion(dx)
+        && mac_cursor_at_right_edge()
+    {
         let (_, y_ratio) = mac_cursor_ratios().unwrap_or((0.0, 0.5));
         request_host_release(
             hid_sink,
@@ -760,7 +809,10 @@ async fn handle_client_motion(
     }
     client_state.update_right_edge_release_arm(dx);
 
-    if client_state.should_release_after_motion(dx) && mac_cursor_at_right_edge() {
+    if mac_right_edge_release_enabled()
+        && client_state.should_release_after_motion(dx)
+        && mac_cursor_at_right_edge()
+    {
         let (_, y_ratio) = mac_cursor_ratios().unwrap_or((0.0, 0.5));
         request_host_release(
             hid_sink,
@@ -1383,10 +1435,23 @@ fn bail_if_invalid_bench(hz: u32, seconds: u32) -> Result<()> {
     Ok(())
 }
 
-async fn run_host(_peer: String, _layout: String) -> Result<()> {
+async fn run_host(
+    _peer: String,
+    _layout: String,
+    _activate_on_start: bool,
+    _entry_x_ratio: f64,
+    _entry_y_ratio: f64,
+) -> Result<()> {
     #[cfg(windows)]
     {
-        platform::windows::run_host(_peer, _layout).await
+        platform::windows::run_host(
+            _peer,
+            _layout,
+            _activate_on_start,
+            _entry_x_ratio,
+            _entry_y_ratio,
+        )
+        .await
     }
 
     #[cfg(not(windows))]

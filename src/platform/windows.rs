@@ -109,10 +109,18 @@ fn prepare_low_latency_thread(label: &'static str) {
     }
 }
 
-pub async fn run_host(peer: String, layout: String) -> Result<()> {
+pub async fn run_host(
+    peer: String,
+    layout: String,
+    activate_on_start: bool,
+    entry_x_ratio: f64,
+    entry_y_ratio: f64,
+) -> Result<()> {
     if layout != "mac-left" {
         bail!("only --layout mac-left is implemented right now");
     }
+    let entry_x_ratio = entry_x_ratio.clamp(0.02, 0.98);
+    let entry_y_ratio = entry_y_ratio.clamp(0.02, 0.98);
 
     let stream = TcpStream::connect(&peer)
         .await
@@ -129,6 +137,7 @@ pub async fn run_host(peer: String, layout: String) -> Result<()> {
             tx,
             layout.clone(),
             direct_motion,
+            activate_on_start.then_some((entry_x_ratio, entry_y_ratio)),
         )))
         .map_err(|_| anyhow!("Windows host state was already initialized"))?;
 
@@ -136,7 +145,7 @@ pub async fn run_host(peer: String, layout: String) -> Result<()> {
     tokio::spawn(writer_task(write_half, rx, motion_transport));
     tokio::spawn(control_reader_task(read_half));
 
-    info!(%peer, %layout, "starting Windows host capture");
+    info!(%peer, %layout, activate_on_start, entry_x_ratio, entry_y_ratio, "starting Windows host capture");
     tokio::task::spawn_blocking(run_message_loop)
         .await
         .context("join Windows host message loop")?
@@ -1145,6 +1154,18 @@ fn run_message_loop() -> Result<()> {
     }
 
     info!("Windows Raw Input host is ready; Ctrl+Alt+\\ toggles remote control");
+    if let Ok(mut state) = lock_state() {
+        if let Some((entry_x_ratio, entry_y_ratio)) = state.activate_on_start.take()
+            && let Err(err) = state.set_remote_active(
+                true,
+                "activate-on-start",
+                Some(entry_x_ratio),
+                Some(entry_y_ratio),
+            )
+        {
+            warn!(?err, "failed to activate remote control on start");
+        }
+    }
 
     let mut msg = MSG::default();
     loop {
@@ -1868,6 +1889,7 @@ struct HostState {
     saved_monitor_rect: Option<RECT>,
     last_hotkey_toggle: Option<Instant>,
     left_edge_armed: bool,
+    activate_on_start: Option<(f64, f64)>,
 }
 
 impl HostState {
@@ -1875,6 +1897,7 @@ impl HostState {
         tx: mpsc::UnboundedSender<HostCommand>,
         layout: String,
         direct_motion: Option<SharedUdpMotionWriter>,
+        activate_on_start: Option<(f64, f64)>,
     ) -> Self {
         Self {
             tx,
@@ -1889,6 +1912,7 @@ impl HostState {
             saved_monitor_rect: None,
             last_hotkey_toggle: None,
             left_edge_armed: true,
+            activate_on_start,
         }
     }
 

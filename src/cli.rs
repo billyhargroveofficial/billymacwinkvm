@@ -80,6 +80,15 @@ pub enum Command {
 
         #[arg(long, default_value = "mac-left")]
         layout: String,
+
+        #[arg(long)]
+        activate_on_start: bool,
+
+        #[arg(long, default_value_t = 0.5)]
+        entry_x_ratio: f64,
+
+        #[arg(long, default_value_t = 0.5)]
+        entry_y_ratio: f64,
     },
 }
 
