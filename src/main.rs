@@ -69,6 +69,7 @@ async fn main() -> Result<()> {
             activate_on_start,
             entry_x_ratio,
             entry_y_ratio,
+            no_local_capture,
         } => {
             run_host(
                 peer,
@@ -76,6 +77,7 @@ async fn main() -> Result<()> {
                 activate_on_start,
                 entry_x_ratio,
                 entry_y_ratio,
+                no_local_capture,
             )
             .await
         }
@@ -1441,6 +1443,7 @@ async fn run_host(
     _activate_on_start: bool,
     _entry_x_ratio: f64,
     _entry_y_ratio: f64,
+    _no_local_capture: bool,
 ) -> Result<()> {
     #[cfg(windows)]
     {
@@ -1450,6 +1453,7 @@ async fn run_host(
             _activate_on_start,
             _entry_x_ratio,
             _entry_y_ratio,
+            _no_local_capture,
         )
         .await
     }

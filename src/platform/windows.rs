@@ -77,6 +77,7 @@ const RAW_CADENCE_TIMER_ID: usize = 3;
 static HOST_STATE: OnceLock<Mutex<HostState>> = OnceLock::new();
 static DIRECT_MOTION_FAST: OnceLock<SharedUdpMotionWriter> = OnceLock::new();
 static REMOTE_ACTIVE_FAST: AtomicBool = AtomicBool::new(false);
+static LOCAL_MOUSE_CAPTURE_FAST: AtomicBool = AtomicBool::new(true);
 static RAW_CADENCE_STATE: OnceLock<Mutex<RawCadenceState>> = OnceLock::new();
 
 thread_local! {
@@ -115,12 +116,15 @@ pub async fn run_host(
     activate_on_start: bool,
     entry_x_ratio: f64,
     entry_y_ratio: f64,
+    no_local_capture: bool,
 ) -> Result<()> {
     if layout != "mac-left" {
         bail!("only --layout mac-left is implemented right now");
     }
     let entry_x_ratio = entry_x_ratio.clamp(0.02, 0.98);
     let entry_y_ratio = entry_y_ratio.clamp(0.02, 0.98);
+    let local_mouse_capture = !no_local_capture;
+    LOCAL_MOUSE_CAPTURE_FAST.store(local_mouse_capture, Ordering::Relaxed);
 
     let stream = TcpStream::connect(&peer)
         .await
@@ -138,6 +142,7 @@ pub async fn run_host(
             layout.clone(),
             direct_motion,
             activate_on_start.then_some((entry_x_ratio, entry_y_ratio)),
+            local_mouse_capture,
         )))
         .map_err(|_| anyhow!("Windows host state was already initialized"))?;
 
@@ -145,7 +150,7 @@ pub async fn run_host(
     tokio::spawn(writer_task(write_half, rx, motion_transport));
     tokio::spawn(control_reader_task(read_half));
 
-    info!(%peer, %layout, activate_on_start, entry_x_ratio, entry_y_ratio, "starting Windows host capture");
+    info!(%peer, %layout, activate_on_start, entry_x_ratio, entry_y_ratio, local_mouse_capture, "starting Windows host capture");
     tokio::task::spawn_blocking(run_message_loop)
         .await
         .context("join Windows host message loop")?
@@ -1707,6 +1712,7 @@ unsafe fn cleanup_host_state() {
         state.uninstall_hooks();
         state.remote_active = false;
         REMOTE_ACTIVE_FAST.store(false, Ordering::Relaxed);
+        LOCAL_MOUSE_CAPTURE_FAST.store(true, Ordering::Relaxed);
         state.left_edge_armed = false;
         return;
     }
@@ -1724,6 +1730,7 @@ fn release_host_state_after_transport_loss(reason: &'static str) {
             }
             state.remote_active = false;
             REMOTE_ACTIVE_FAST.store(false, Ordering::Relaxed);
+            LOCAL_MOUSE_CAPTURE_FAST.store(true, Ordering::Relaxed);
             state.left_edge_armed = false;
             state.pressed_modifier_keys.clear();
             state.active_modifiers.clear();
@@ -1745,7 +1752,10 @@ fn install_persistent_hooks() -> Result<()> {
 }
 
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code == HC_ACTION as i32 && REMOTE_ACTIVE_FAST.load(Ordering::Relaxed) {
+    if code == HC_ACTION as i32
+        && REMOTE_ACTIVE_FAST.load(Ordering::Relaxed)
+        && LOCAL_MOUSE_CAPTURE_FAST.load(Ordering::Relaxed)
+    {
         return LRESULT(1);
     }
 
@@ -1890,6 +1900,7 @@ struct HostState {
     last_hotkey_toggle: Option<Instant>,
     left_edge_armed: bool,
     activate_on_start: Option<(f64, f64)>,
+    local_mouse_capture: bool,
 }
 
 impl HostState {
@@ -1898,6 +1909,7 @@ impl HostState {
         layout: String,
         direct_motion: Option<SharedUdpMotionWriter>,
         activate_on_start: Option<(f64, f64)>,
+        local_mouse_capture: bool,
     ) -> Self {
         Self {
             tx,
@@ -1913,6 +1925,7 @@ impl HostState {
             last_hotkey_toggle: None,
             left_edge_armed: true,
             activate_on_start,
+            local_mouse_capture,
         }
     }
 
@@ -1947,6 +1960,7 @@ impl HostState {
             if let Err(err) = self.capture_local_controls() {
                 self.remote_active = false;
                 REMOTE_ACTIVE_FAST.store(false, Ordering::Relaxed);
+                LOCAL_MOUSE_CAPTURE_FAST.store(true, Ordering::Relaxed);
                 self.release_local_controls(false, None, None);
                 self.left_edge_armed = false;
                 return Err(err);
@@ -1954,6 +1968,7 @@ impl HostState {
             let capture_elapsed = capture_started.elapsed();
             self.remote_active = true;
             REMOTE_ACTIVE_FAST.store(true, Ordering::Relaxed);
+            LOCAL_MOUSE_CAPTURE_FAST.store(self.local_mouse_capture, Ordering::Relaxed);
             self.left_edge_armed = false;
             let send_state_started = Instant::now();
             let send_result = match entry_x_ratio.zip(entry_y_ratio) {
@@ -1970,6 +1985,7 @@ impl HostState {
             if let Err(err) = send_result {
                 self.remote_active = false;
                 REMOTE_ACTIVE_FAST.store(false, Ordering::Relaxed);
+                LOCAL_MOUSE_CAPTURE_FAST.store(true, Ordering::Relaxed);
                 self.release_local_controls(true, None, None);
                 return Err(err);
             }
@@ -1978,6 +1994,7 @@ impl HostState {
             if let Err(err) = self.send_current_modifier_state() {
                 self.remote_active = false;
                 REMOTE_ACTIVE_FAST.store(false, Ordering::Relaxed);
+                LOCAL_MOUSE_CAPTURE_FAST.store(true, Ordering::Relaxed);
                 self.release_local_controls(true, None, None);
                 return Err(err);
             }
@@ -1996,6 +2013,7 @@ impl HostState {
         } else {
             self.remote_active = false;
             REMOTE_ACTIVE_FAST.store(false, Ordering::Relaxed);
+            LOCAL_MOUSE_CAPTURE_FAST.store(true, Ordering::Relaxed);
             self.left_edge_armed = false;
             self.release_local_controls(true, entry_x_ratio, entry_y_ratio);
             self.send(HostCommand::HostState { active, reason })?;
@@ -2102,6 +2120,17 @@ impl HostState {
         });
         self.saved_cursor_pos = Some(cursor);
         self.saved_monitor_rect = monitor_rect_for_point(cursor);
+        if !self.local_mouse_capture {
+            if latency::enabled() {
+                info!(
+                    target: "softkvm::latency",
+                    x = cursor.x,
+                    y = cursor.y,
+                    "windows local mouse capture disabled for VM test"
+                );
+            }
+            return Ok(());
+        }
         let clip_started = Instant::now();
         unsafe {
             if let Err(err) = clip_cursor_to_parking_box(cursor) {

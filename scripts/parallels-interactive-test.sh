@@ -19,6 +19,7 @@ UDP_SEND_MODE="${SOFTKVM_UDP_SEND_MODE:-coalesced}"
 WIN_ACTIVATE_ON_START="${SOFTKVM_WIN_ACTIVATE_ON_START:-1}"
 WIN_ENTRY_X_RATIO="${SOFTKVM_WIN_ENTRY_X_RATIO:-0.5}"
 WIN_ENTRY_Y_RATIO="${SOFTKVM_WIN_ENTRY_Y_RATIO:-0.5}"
+WIN_NO_LOCAL_CAPTURE="${SOFTKVM_WIN_NO_LOCAL_CAPTURE:-1}"
 LATENCY_LOG="${SOFTKVM_LATENCY_LOG:-1}"
 LATENCY_WARN_MS="${SOFTKVM_LATENCY_WARN_MS:-1}"
 MAC_RUST_LOG="${SOFTKVM_MAC_RUST_LOG:-softkvm=info,softkvm::latency=info}"
@@ -252,6 +253,9 @@ Remove-Item -Force \$out,\$err -ErrorAction SilentlyContinue; \
 \$softkvmArgs = @('host', '--peer', '${MAC_PARALLELS_IP}:$PORT', '--layout', '$LAYOUT')
 if ('$WIN_ACTIVATE_ON_START' -ne '0') {
     \$softkvmArgs += @('--activate-on-start', '--entry-x-ratio', '$WIN_ENTRY_X_RATIO', '--entry-y-ratio', '$WIN_ENTRY_Y_RATIO')
+}
+if ('$WIN_NO_LOCAL_CAPTURE' -ne '0') {
+    \$softkvmArgs += @('--no-local-capture')
 }
 & \$exe @softkvmArgs > \$out 2> \$err
 '@ | Set-Content -Path \$script -Encoding UTF8; \

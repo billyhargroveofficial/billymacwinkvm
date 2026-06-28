@@ -89,6 +89,9 @@ pub enum Command {
 
         #[arg(long, default_value_t = 0.5)]
         entry_y_ratio: f64,
+
+        #[arg(long)]
+        no_local_capture: bool,
     },
 }
 
