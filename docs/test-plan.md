@@ -32,51 +32,6 @@ This runs two checks:
 
 Important: plain `prlctl exec` runs as `nt authority\system`, which is not an interactive desktop. Raw Input and `RegisterHotKey` can fail there with `This operation requires an interactive window station`. The host smoke uses `prlctl exec --current-user` on purpose.
 
-## Interactive Parallels Cursor Test
-
-Use this when testing edge switching manually inside the Windows VM instead of
-moving between two physical computers:
-
-```bash
-./scripts/parallels-interactive-test.sh prepare
-```
-
-That command:
-
-- starts the Windows VM if needed;
-- switches Parallels mouse/keyboard to capture-friendly mode;
-- builds the macOS binary;
-- builds the Windows ARM binary;
-- copies `softkvm.exe` into `%TEMP%\softkvm-vm-interactive` inside Windows;
-- writes exact restart commands to `target/softkvm-parallels-interactive/latest/COMMANDS.txt`.
-
-Run the manual test with two Mac terminals:
-
-```bash
-./scripts/parallels-interactive-test.sh mac
-```
-
-```bash
-./scripts/parallels-interactive-test.sh win
-```
-
-Click inside the Windows VM window before testing. In capture mode, Parallels
-should keep the pointer inside the VM window, making the softkvm left-edge
-transition visible. Restore normal shared-cursor behavior after testing:
-
-```bash
-./scripts/parallels-interactive-test.sh stop
-./scripts/parallels-interactive-test.sh capture-off
-```
-
-The Parallels input toggles are:
-
-```bash
-./scripts/parallels-interactive-test.sh capture-on
-./scripts/parallels-interactive-test.sh capture-off
-./scripts/parallels-interactive-test.sh capture-status
-```
-
 ## Automated Latency Lab
 
 Run the combined local and Parallels latency lab from macOS:
