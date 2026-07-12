@@ -12,8 +12,8 @@ param(
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $env:RUST_LOG = if ($env:RUST_LOG) { $env:RUST_LOG } else { "softkvm=info" }
-$env:SOFTKVM_MOTION_TRANSPORT = if ($env:SOFTKVM_MOTION_TRANSPORT) { $env:SOFTKVM_MOTION_TRANSPORT } else { "tcp" }
-$env:SOFTKVM_UDP_SEND_MODE = if ($env:SOFTKVM_UDP_SEND_MODE) { $env:SOFTKVM_UDP_SEND_MODE } else { "coalesced" }
+$env:SOFTKVM_MOTION_TRANSPORT = if ($env:SOFTKVM_MOTION_TRANSPORT) { $env:SOFTKVM_MOTION_TRANSPORT } else { "udp" }
+$env:SOFTKVM_UDP_SEND_MODE = if ($env:SOFTKVM_UDP_SEND_MODE) { $env:SOFTKVM_UDP_SEND_MODE } else { "immediate" }
 
 if (!(Test-Path $Exe)) {
   throw "softkvm executable not found: $Exe"

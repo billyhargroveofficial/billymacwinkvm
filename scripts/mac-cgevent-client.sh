@@ -15,19 +15,17 @@ if [[ "${SOFTKVM_LATENCY_LOG:-0}" != "0" ]]; then
 fi
 echo
 
-cargo build
+cargo build --release
 
 echo
 echo "Starting real macOS input receiver through cg-event."
 echo "Leave this terminal open. Stop with Ctrl+C."
 env \
-  RUST_LOG="${RUST_LOG:-softkvm=info,softkvm::latency=info}" \
+  RUST_LOG="${RUST_LOG:-softkvm=info}" \
   SOFTKVM_MAC_MODIFIER_POLICY="${SOFTKVM_MAC_MODIFIER_POLICY:-swap-alt-super}" \
   SOFTKVM_CGEVENT_POINTER_SPEED="${SOFTKVM_CGEVENT_POINTER_SPEED:-1.0}" \
   SOFTKVM_CGEVENT_MOTION_METHOD="${SOFTKVM_CGEVENT_MOTION_METHOD:-event}" \
-  SOFTKVM_CGEVENT_TAP="${SOFTKVM_CGEVENT_TAP:-annotated-session}" \
-  SOFTKVM_MAC_MOTION_MODE="${SOFTKVM_MAC_MOTION_MODE:-coalesced}" \
-  SOFTKVM_MAC_MOTION_FLUSH_MS="${SOFTKVM_MAC_MOTION_FLUSH_MS:-1}" \
+  SOFTKVM_CGEVENT_TAP="${SOFTKVM_CGEVENT_TAP:-session}" \
   SOFTKVM_LATENCY_LOG="${SOFTKVM_LATENCY_LOG:-0}" \
   SOFTKVM_LATENCY_WARN_MS="${SOFTKVM_LATENCY_WARN_MS:-8}" \
-  "$ROOT/target/debug/softkvm" client --listen "0.0.0.0:$PORT" --sink cg-event
+  "$ROOT/target/release/softkvm" client --listen "0.0.0.0:$PORT" --sink cg-event

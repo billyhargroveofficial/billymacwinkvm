@@ -44,10 +44,9 @@ The lab defaults to the current low-jitter CGEvent diagnostic path:
 
 - `SOFTKVM_LAB_SINK=cg-event`
 - `SOFTKVM_CGEVENT_MOTION_METHOD=event`
-- `SOFTKVM_CGEVENT_TAP=annotated-session`
-- `SOFTKVM_MAC_MOTION_MODE=coalesced`
-- `SOFTKVM_MAC_MOTION_FLUSH_MS=1`
-- `SOFTKVM_UDP_SEND_MODE=coalesced`
+- `SOFTKVM_CGEVENT_TAP=session`
+- event-driven native macOS UDP receive/injection threads
+- `SOFTKVM_UDP_SEND_MODE=immediate`
 - `SOFTKVM_LATENCY_LOG=1`
 - `SOFTKVM_LATENCY_WARN_MS=1`
 
@@ -185,6 +184,6 @@ Read the `summary:` block first. It flags one or more likely sources using the
 current marker set:
 
 - `Windows send/capture`: slow `windows mouse raw input handling` or `windows udp motion send latency`.
-- `network or Mac receive gap`: slow `mac udp motion receive gap`.
-- `CGEvent/warp slow call`: slow `cgevent warp motion latency`, `cgevent mouse post latency`, or direct immediate Mac apply latency.
+- `network or Mac receive gap`: slow `mac native UDP receive gap`.
+- `CGEvent/warp slow call`: slow `cgevent warp motion latency`, `cgevent mouse post latency`, or `mac event-driven motion apply latency`.
 - `no in-process evidence`: the current parsed markers were present but stayed below the analyzer threshold, so look outside these in-process spans.

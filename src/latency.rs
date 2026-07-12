@@ -19,8 +19,8 @@ pub fn slow(elapsed: Duration) -> bool {
     elapsed >= warn_threshold()
 }
 
-pub fn report(elapsed: Duration) -> bool {
-    enabled() || slow(elapsed)
+pub fn report(_elapsed: Duration) -> bool {
+    enabled()
 }
 
 pub fn ms(elapsed: Duration) -> f64 {

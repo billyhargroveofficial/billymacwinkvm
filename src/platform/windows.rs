@@ -102,7 +102,7 @@ pub fn prepare_low_latency_process() {
     prepare_low_latency_thread("main thread");
 }
 
-fn prepare_low_latency_thread(label: &'static str) {
+pub(crate) fn prepare_low_latency_thread(label: &'static str) {
     if let Err(err) = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) } {
         warn!(?err, label, "failed to raise Windows thread priority");
     } else {
@@ -553,7 +553,7 @@ enum MotionTransport {
 impl MotionTransport {
     async fn connect(peer: &str) -> Self {
         let configured = std::env::var("SOFTKVM_MOTION_TRANSPORT")
-            .unwrap_or_else(|_| "tcp".to_owned())
+            .unwrap_or_else(|_| "udp".to_owned())
             .to_ascii_lowercase();
         if !matches!(configured.as_str(), "udp" | "udp-binary" | "binary") {
             info!(mode = configured, "using tcp/json motion transport");
@@ -751,7 +751,7 @@ fn udp_send_mode() -> UdpSendMode {
     static MODE: OnceLock<UdpSendMode> = OnceLock::new();
     *MODE.get_or_init(|| {
         match std::env::var("SOFTKVM_UDP_SEND_MODE")
-            .unwrap_or_else(|_| "coalesced".to_owned())
+            .unwrap_or_else(|_| "immediate".to_owned())
             .to_ascii_lowercase()
             .as_str()
         {
@@ -760,9 +760,9 @@ fn udp_send_mode() -> UdpSendMode {
             other => {
                 warn!(
                     value = other,
-                    "unknown SOFTKVM_UDP_SEND_MODE; using coalesced"
+                    "unknown SOFTKVM_UDP_SEND_MODE; using immediate"
                 );
-                UdpSendMode::Coalesced
+                UdpSendMode::Immediate
             }
         }
     })

@@ -218,9 +218,12 @@ def analyze(path: Path):
             series["mac_apply_motion"].append((ts, line_no))
         if "mac motion coalesced flush" in line:
             series["mac_motion_coalesced_flush"].append((ts, line_no))
-        if "mac udp motion receive gap" in line:
+        if "mac udp motion receive gap" in line or "mac native UDP receive gap" in line:
             series["mac_udp_receive_gap"].append((ts, line_no))
-        if "mac direct immediate motion apply latency" in line:
+        if (
+            "mac direct immediate motion apply latency" in line
+            or "mac event-driven motion apply latency" in line
+        ):
             series["mac_direct_immediate_apply"].append((ts, line_no))
         if "cgevent warp motion latency" in line:
             series["mac_cgevent_warp"].append((ts, line_no))
@@ -246,8 +249,13 @@ def analyze(path: Path):
                     label = "mac_motion_apply_ms"
                 elif "mac motion coalesced flush" in line and key == "queued_ms":
                     label = "mac_motion_coalesced_queue_ms"
-                elif "mac udp motion receive gap" in line and key == "gap_ms":
+                elif (
+                    "mac udp motion receive gap" in line
+                    or "mac native UDP receive gap" in line
+                ) and key == "gap_ms":
                     label = "mac_udp_receive_gap_ms"
+                elif "mac event-driven motion apply latency" in line and key == "elapsed_ms":
+                    label = "mac_direct_apply_ms"
                 elif "mac direct immediate motion apply latency" in line and key == "elapsed_ms":
                     label = "mac_direct_immediate_apply_ms"
                 elif "cgevent warp motion latency" in line and key == "elapsed_ms":

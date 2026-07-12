@@ -22,8 +22,8 @@ prlctl list --all "$VM"
 echo
 echo "== Building Windows ARM binary =="
 rustup target add "$TARGET" >/dev/null
-cargo zigbuild --target "$TARGET"
-cp "target/$TARGET/debug/softkvm.exe" "$EXE_MAC"
+cargo zigbuild --release --target "$TARGET"
+cp "target/$TARGET/release/softkvm.exe" "$EXE_MAC"
 ls -lh "$EXE_MAC"
 
 echo

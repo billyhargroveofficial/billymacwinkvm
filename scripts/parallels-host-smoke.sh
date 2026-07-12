@@ -12,10 +12,10 @@ SINK="${SOFTKVM_HOST_SMOKE_SINK:-${SOFTKVM_LAB_SINK:-cg-event}}"
 MAC_MOTION_MODE="${SOFTKVM_MAC_MOTION_MODE:-coalesced}"
 MAC_MOTION_FLUSH_MS="${SOFTKVM_MAC_MOTION_FLUSH_MS:-1}"
 CGEVENT_MOTION_METHOD="${SOFTKVM_CGEVENT_MOTION_METHOD:-event}"
-CGEVENT_TAP="${SOFTKVM_CGEVENT_TAP:-annotated-session}"
+CGEVENT_TAP="${SOFTKVM_CGEVENT_TAP:-session}"
 CGEVENT_POINTER_SPEED="${SOFTKVM_CGEVENT_POINTER_SPEED:-1.0}"
-UDP_SEND_MODE="${SOFTKVM_UDP_SEND_MODE:-coalesced}"
-MOTION_TRANSPORT="${SOFTKVM_MOTION_TRANSPORT:-tcp}"
+UDP_SEND_MODE="${SOFTKVM_UDP_SEND_MODE:-immediate}"
+MOTION_TRANSPORT="${SOFTKVM_MOTION_TRANSPORT:-udp}"
 LATENCY_LOG="${SOFTKVM_LATENCY_LOG:-1}"
 LATENCY_WARN_MS="${SOFTKVM_LATENCY_WARN_MS:-1}"
 HOST_RUST_LOG="${SOFTKVM_HOST_SMOKE_RUST_LOG:-softkvm=info,softkvm::latency=info}"
@@ -101,7 +101,7 @@ print_dry_run_plan() {
   echo "Would build macOS softkvm and Windows target $TARGET."
   echo "Would start Mac client:"
   echo "  RUST_LOG=$HOST_RUST_LOG SOFTKVM_LATENCY_LOG=$LATENCY_LOG SOFTKVM_LATENCY_WARN_MS=$LATENCY_WARN_MS SOFTKVM_MAC_MOTION_MODE=$MAC_MOTION_MODE SOFTKVM_MAC_MOTION_FLUSH_MS=$MAC_MOTION_FLUSH_MS SOFTKVM_CGEVENT_MOTION_METHOD=$CGEVENT_MOTION_METHOD SOFTKVM_CGEVENT_TAP=$CGEVENT_TAP SOFTKVM_CGEVENT_POINTER_SPEED=$CGEVENT_POINTER_SPEED SOFTKVM_UDP_SEND_MODE=$UDP_SEND_MODE SOFTKVM_MOTION_TRANSPORT=$MOTION_TRANSPORT"
-  echo "  $ROOT/target/debug/softkvm client --listen 0.0.0.0:$PORT --sink $SINK"
+  echo "  $ROOT/target/release/softkvm client --listen 0.0.0.0:$PORT --sink $SINK"
   echo "Would run Windows host as current user against ${MAC_PARALLELS_IP}:$PORT for ${HOST_SECONDS}s."
   echo
   echo "Dry-run summary: $SUMMARY"
@@ -132,14 +132,14 @@ fi
 
 echo
 echo "== Building Mac binary =="
-cargo build
-"$ROOT/target/debug/softkvm" build-info
+cargo build --release
+"$ROOT/target/release/softkvm" build-info
 
 echo
 echo "== Building Windows ARM binary =="
 rustup target add "$TARGET" >/dev/null
-cargo zigbuild --target "$TARGET"
-cp "target/$TARGET/debug/softkvm.exe" "$EXE_MAC"
+cargo zigbuild --release --target "$TARGET"
+cp "target/$TARGET/release/softkvm.exe" "$EXE_MAC"
 ls -lh "$EXE_MAC"
 
 if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
@@ -159,7 +159,7 @@ env \
   SOFTKVM_CGEVENT_MOTION_METHOD="$CGEVENT_MOTION_METHOD" \
   SOFTKVM_CGEVENT_TAP="$CGEVENT_TAP" \
   SOFTKVM_CGEVENT_POINTER_SPEED="$CGEVENT_POINTER_SPEED" \
-  "$ROOT/target/debug/softkvm" client --listen "0.0.0.0:$PORT" --sink "$SINK" \
+  "$ROOT/target/release/softkvm" client --listen "0.0.0.0:$PORT" --sink "$SINK" \
   >"$LOG" 2>&1 &
 CLIENT_PID=$!
 

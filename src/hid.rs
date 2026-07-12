@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 use tracing::info;
 #[cfg(target_os = "macos")]
+use tracing::trace;
+#[cfg(target_os = "macos")]
 use tracing::warn;
 
 #[cfg(target_os = "macos")]
@@ -65,12 +67,30 @@ pub async fn native_hid_sink_async() -> Result<Box<dyn HidSink>> {
 
 #[cfg(target_os = "macos")]
 pub async fn cgevent_sink_async() -> Result<Box<dyn HidSink>> {
-    Ok(Box::new(CgEventSink::connect().await?))
+    Ok(Box::new(CgEventSink::connect()?))
 }
 
 #[cfg(not(target_os = "macos"))]
 pub async fn cgevent_sink_async() -> Result<Box<dyn HidSink>> {
     anyhow::bail!("CGEvent sink is macOS-only")
+}
+
+#[cfg(target_os = "macos")]
+pub struct CgEventMotionSink {
+    inner: CgEventSink,
+}
+
+#[cfg(target_os = "macos")]
+impl CgEventMotionSink {
+    pub fn connect() -> Result<Self> {
+        Ok(Self {
+            inner: CgEventSink::connect()?,
+        })
+    }
+
+    pub fn apply_motion(&mut self, dx: i32, dy: i32) -> Result<()> {
+        self.inner.post_motion(dx, dy)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -124,7 +144,7 @@ struct CgEventSink {
 
 #[cfg(target_os = "macos")]
 impl CgEventSink {
-    async fn connect() -> Result<Self> {
+    fn connect() -> Result<Self> {
         let modifier_policy = MacModifierPolicy::from_env();
         let pointer_speed = cgevent_pointer_speed();
         let motion_method = cgevent_motion_method();
@@ -201,7 +221,7 @@ impl CgEventSink {
         };
         if (clamped.x - point.x).abs() > f64::EPSILON || (clamped.y - point.y).abs() > f64::EPSILON
         {
-            warn!(
+            trace!(
                 x = point.x,
                 y = point.y,
                 clamped_x = clamped.x,
@@ -229,7 +249,7 @@ impl CgEventSink {
         if buttons == 0 && cgevent_motion_method() == CgEventMotionMethod::Warp {
             return Self::post_warp_motion(point);
         }
-        self.post_mouse_event(event_type, point, CG_MOUSE_BUTTON_LEFT)
+        self.post_mouse_event(event_type, point, CG_MOUSE_BUTTON_LEFT, Some((dx, dy)))
     }
 
     fn post_warp_motion(point: CGPoint) -> Result<()> {
@@ -282,14 +302,27 @@ impl CgEventSink {
                 (CG_EVENT_OTHER_MOUSE_UP, CG_MOUSE_BUTTON_CENTER)
             }
         };
-        self.post_mouse_event(event_type, point, cg_button)
+        self.post_mouse_event(event_type, point, cg_button, None)
     }
 
-    fn post_mouse_event(&self, event_type: u32, point: CGPoint, button: u32) -> Result<()> {
+    fn post_mouse_event(
+        &self,
+        event_type: u32,
+        point: CGPoint,
+        button: u32,
+        delta: Option<(i32, i32)>,
+    ) -> Result<()> {
         let started = Instant::now();
         let event = unsafe { CGEventCreateMouseEvent(std::ptr::null(), event_type, point, button) };
         if event.is_null() {
             bail!("CGEventCreateMouseEvent returned null");
+        }
+        unsafe {
+            if let Some((dx, dy)) = delta {
+                CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_DELTA_X, i64::from(dx));
+                CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_DELTA_Y, i64::from(dy));
+            }
+            CGEventSetFlags(event, self.modifiers);
         }
         let create_elapsed = started.elapsed();
         let post_started = Instant::now();
@@ -716,6 +749,10 @@ const CG_MOUSE_BUTTON_RIGHT: u32 = 1;
 #[cfg(target_os = "macos")]
 const CG_MOUSE_BUTTON_CENTER: u32 = 2;
 #[cfg(target_os = "macos")]
+const CG_MOUSE_EVENT_DELTA_X: u32 = 4;
+#[cfg(target_os = "macos")]
+const CG_MOUSE_EVENT_DELTA_Y: u32 = 5;
+#[cfg(target_os = "macos")]
 const CG_SCROLL_EVENT_UNIT_LINE: u32 = 1;
 #[cfg(target_os = "macos")]
 const CG_EVENT_FLAG_MASK_SHIFT: u64 = 0x0002_0000;
@@ -753,6 +790,7 @@ unsafe extern "C" {
         key_down: bool,
     ) -> *mut std::ffi::c_void;
     fn CGEventSetFlags(event: *mut std::ffi::c_void, flags: u64);
+    fn CGEventSetIntegerValueField(event: *mut std::ffi::c_void, field: u32, value: i64);
     fn CGWarpMouseCursorPosition(new_cursor_position: CGPoint) -> i32;
     fn CGSetLocalEventsSuppressionInterval(seconds: f64);
     fn CGEventPost(tap: u32, event: *mut std::ffi::c_void);
@@ -835,7 +873,7 @@ fn cgevent_motion_method() -> CgEventMotionMethod {
 fn cgevent_tap() -> CgEventTap {
     *CGEVENT_TAP.get_or_init(|| {
         match std::env::var("SOFTKVM_CGEVENT_TAP")
-            .unwrap_or_else(|_| "annotated-session".to_owned())
+            .unwrap_or_else(|_| "session".to_owned())
             .to_ascii_lowercase()
             .as_str()
         {
@@ -845,11 +883,8 @@ fn cgevent_tap() -> CgEventTap {
                 CgEventTap::AnnotatedSession
             }
             other => {
-                warn!(
-                    value = other,
-                    "unknown SOFTKVM_CGEVENT_TAP; using annotated-session"
-                );
-                CgEventTap::AnnotatedSession
+                warn!(value = other, "unknown SOFTKVM_CGEVENT_TAP; using session");
+                CgEventTap::Session
             }
         }
     })

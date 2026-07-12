@@ -8,8 +8,8 @@ echo "== Rust fmt =="
 cargo fmt -- --check
 
 echo
-echo "== macOS build =="
-cargo build
+echo "== macOS release build =="
+cargo build --release
 
 echo
 echo "== Rust tests =="
@@ -25,7 +25,7 @@ if command -v cargo-zigbuild >/dev/null 2>&1 || cargo zigbuild --version >/dev/n
   echo
   echo "== Windows ARM cross-build =="
   rustup target add aarch64-pc-windows-gnullvm >/dev/null
-  cargo zigbuild --target aarch64-pc-windows-gnullvm
+  cargo zigbuild --release --target aarch64-pc-windows-gnullvm
 else
   echo
   echo "== Windows ARM cross-build skipped: cargo-zigbuild is not installed =="

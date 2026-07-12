@@ -18,7 +18,8 @@ The repo currently contains:
 - Rust CLI scaffold.
 - Protocol-only `client` and `probe` commands.
 - Windows Raw Input host MVP with `Ctrl+Alt+\` toggle and `mac-left` edge activation.
-- Motion transport defaults to TCP coalescing for better tail-latency; binary UDP `SKM1` remains available with `SOFTKVM_MOTION_TRANSPORT=udp`.
+- Mouse motion defaults to immediate binary UDP `SKM1`; reliable state, keyboard, buttons, wheel, and focus remain on TCP.
+- The macOS UDP hot path uses a blocking receive thread plus an event-driven `CGEvent` writer thread, both at user-interactive QoS. There is no Tokio timer in the production mouse path.
 - Native macOS `IOHIDUserDevice` probe/backend scaffold; current unsigned dev build fails without Apple's `com.apple.developer.hid.virtual.device` entitlement.
 - Setup docs under `docs/`.
 
@@ -57,12 +58,11 @@ Package a versioned Windows transfer zip:
 Each run bumps `kit-version.txt` and writes `dist/softkvm-windows-test-kit-vNNNN-<git>.zip`
 plus `dist/softkvm-windows-test-kit-latest.zip`.
 
-macOS receiver coalesces high-rate mouse deltas before posting input.
-Default flush interval is `1ms`; for real-machine tuning:
+The normal launcher builds and runs the optimized macOS binary. Latency markers
+are completely disabled in the hot path unless explicitly requested:
 
 ```bash
-SOFTKVM_MAC_MOTION_FLUSH_MS=1 ./scripts/mac-cgevent-client.sh
-SOFTKVM_MAC_MOTION_FLUSH_MS=4 ./scripts/mac-cgevent-client.sh
+SOFTKVM_LATENCY_LOG=1 RUST_LOG=softkvm=info,softkvm::latency=info ./scripts/mac-cgevent-client.sh
 ```
 
 ## Docs

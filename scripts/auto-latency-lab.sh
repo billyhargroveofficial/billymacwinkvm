@@ -13,9 +13,9 @@ SINK="${SOFTKVM_LAB_SINK:-cg-event}"
 MAC_MOTION_MODE="${SOFTKVM_MAC_MOTION_MODE:-coalesced}"
 MAC_MOTION_FLUSH_MS="${SOFTKVM_MAC_MOTION_FLUSH_MS:-1}"
 CGEVENT_MOTION_METHOD="${SOFTKVM_CGEVENT_MOTION_METHOD:-event}"
-CGEVENT_TAP="${SOFTKVM_CGEVENT_TAP:-annotated-session}"
+CGEVENT_TAP="${SOFTKVM_CGEVENT_TAP:-session}"
 CGEVENT_POINTER_SPEED="${SOFTKVM_CGEVENT_POINTER_SPEED:-1.0}"
-UDP_SEND_MODE="${SOFTKVM_UDP_SEND_MODE:-coalesced}"
+UDP_SEND_MODE="${SOFTKVM_UDP_SEND_MODE:-immediate}"
 LATENCY_LOG="${SOFTKVM_LATENCY_LOG:-1}"
 LATENCY_WARN_MS="${SOFTKVM_LATENCY_WARN_MS:-1}"
 LAB_RUST_LOG="${SOFTKVM_LAB_RUST_LOG:-softkvm=info,softkvm::latency=info}"
@@ -96,7 +96,7 @@ print_dry_run_plan() {
   echo "  SOFTKVM_CGEVENT_TAP=$CGEVENT_TAP"
   echo "  SOFTKVM_CGEVENT_POINTER_SPEED=$CGEVENT_POINTER_SPEED"
   echo "  SOFTKVM_UDP_SEND_MODE=$UDP_SEND_MODE"
-  echo "  $ROOT/target/debug/softkvm client --listen 0.0.0.0:<port> --sink $SINK"
+  echo "  $ROOT/target/release/softkvm client --listen 0.0.0.0:<port> --sink $SINK"
   echo
   echo "Would run local cases:"
   local port="$BASE_PORT"
@@ -150,7 +150,7 @@ start_client() {
     SOFTKVM_CGEVENT_MOTION_METHOD="$CGEVENT_MOTION_METHOD" \
     SOFTKVM_CGEVENT_TAP="$CGEVENT_TAP" \
     SOFTKVM_CGEVENT_POINTER_SPEED="$CGEVENT_POINTER_SPEED" \
-    "$ROOT/target/debug/softkvm" client --listen "0.0.0.0:$port" --sink "$SINK" \
+    "$ROOT/target/release/softkvm" client --listen "0.0.0.0:$port" --sink "$SINK" \
     >"$log" 2>&1 &
   local pid="$!"
   PIDS+=("$pid")
@@ -189,7 +189,7 @@ run_local_case() {
   start_client "$port" "$log"
   pid="$CLIENT_PID"
   set +e
-  "$ROOT/target/debug/softkvm" motion-bench \
+  "$ROOT/target/release/softkvm" motion-bench \
     --peer "127.0.0.1:$port" \
     --transport "$transport" \
     --timing "$timing" \
@@ -263,8 +263,8 @@ fi
 
 echo
 echo "== Build Mac binary =="
-cargo build
-"$ROOT/target/debug/softkvm" build-info
+cargo build --release
+"$ROOT/target/release/softkvm" build-info
 
 port="$BASE_PORT"
 for timing in "${TIMINGS[@]}"; do
@@ -283,8 +283,8 @@ if [[ "${SOFTKVM_SKIP_PARALLELS:-0}" != "1" ]]; then
   fi
   prlctl list --all "$VM"
   rustup target add "$TARGET" >/dev/null
-  cargo zigbuild --target "$TARGET"
-  cp "target/$TARGET/debug/softkvm.exe" "$EXE_MAC"
+  cargo zigbuild --release --target "$TARGET"
+  cp "target/$TARGET/release/softkvm.exe" "$EXE_MAC"
   ls -lh "$EXE_MAC"
 
   port="$((BASE_PORT + 20))"

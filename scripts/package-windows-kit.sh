@@ -44,14 +44,14 @@ mkdir -p "$DIST_DIR"
 echo
 echo "== Build Windows binaries =="
 rustup target add "$X64_TARGET" "$ARM64_TARGET" >/dev/null
-cargo zigbuild --target "$X64_TARGET"
-cargo zigbuild --target "$ARM64_TARGET"
+cargo zigbuild --release --target "$X64_TARGET"
+cargo zigbuild --release --target "$ARM64_TARGET"
 
 rm -rf "$stage_dir"
 mkdir -p "$stage_dir/scripts" "$stage_dir/docs"
 
-cp "target/$X64_TARGET/debug/softkvm.exe" "$stage_dir/softkvm.exe"
-cp "target/$ARM64_TARGET/debug/softkvm.exe" "$stage_dir/softkvm-arm64.exe"
+cp "target/$X64_TARGET/release/softkvm.exe" "$stage_dir/softkvm.exe"
+cp "target/$ARM64_TARGET/release/softkvm.exe" "$stage_dir/softkvm-arm64.exe"
 cp scripts/windows-real-preflight.ps1 "$stage_dir/scripts/windows-real-preflight.ps1"
 cp docs/test-plan.md "$stage_dir/docs/test-plan.md"
 
@@ -84,14 +84,13 @@ Check the exact build:
 
 .\\softkvm.exe build-info
 
-Current default host path uses buffered Raw Input and TCP coalesced motion.
+Current default host path uses buffered Raw Input and immediate UDP motion.
 Fallbacks:
 
 \$env:SOFTKVM_RAW_INPUT_READER="lparam"
 .\\scripts\\windows-real-preflight.ps1 -Exe .\\softkvm.exe -Peer "<mac-ip>:49321" -RunHost
 
-\$env:SOFTKVM_MOTION_TRANSPORT="udp"
-\$env:SOFTKVM_UDP_SEND_MODE="immediate"
+\$env:SOFTKVM_MOTION_TRANSPORT="tcp"
 .\\scripts\\windows-real-preflight.ps1 -Exe .\\softkvm.exe -Peer "<mac-ip>:49321" -RunHost
 
 Diagnose real Windows mouse cadence before involving macOS:

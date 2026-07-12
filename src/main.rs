@@ -33,17 +33,39 @@ const MAC_EDGE_ENTRY_GAP_PX: f64 = 2.0;
 const MAX_MOTION_DELTA_PER_FLUSH: i32 = 512;
 const DEFAULT_MAC_MOTION_FLUSH_INTERVAL_MS: u64 = 1;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    install_signal_guards();
 
     let cli = Cli::parse();
 
     #[cfg(windows)]
     platform::windows::prepare_low_latency_process();
+    #[cfg(target_os = "macos")]
+    platform::macos::prepare_low_latency_thread("main thread");
+
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    runtime.enable_all();
+    runtime.worker_threads(2);
+    runtime.thread_name("softkvm-runtime");
+    #[cfg(windows)]
+    runtime.on_thread_start(|| {
+        platform::windows::prepare_low_latency_thread("Tokio runtime worker");
+    });
+    #[cfg(target_os = "macos")]
+    runtime.on_thread_start(|| {
+        platform::macos::prepare_low_latency_thread("Tokio runtime worker");
+    });
+
+    runtime
+        .build()
+        .context("build Tokio runtime")?
+        .block_on(run(cli))
+}
+
+async fn run(cli: Cli) -> Result<()> {
+    install_signal_guards();
 
     match cli.command {
         Command::BuildInfo => build_info(),
@@ -85,7 +107,7 @@ fn build_info() -> Result<()> {
     println!("softkvm {}", env!("CARGO_PKG_VERSION"));
     println!("build_git_hash {}", env!("SOFTKVM_BUILD_GIT_HASH"));
     println!("protocol_version {}", protocol::PROTOCOL_VERSION);
-    println!("motion_transport default=tcp-json env=SOFTKVM_MOTION_TRANSPORT udp=udp-binary-skm1");
+    println!("motion_transport default=udp-binary-skm1 env=SOFTKVM_MOTION_TRANSPORT tcp=tcp-json");
     println!(
         "mac_motion_flush default_ms={} env=SOFTKVM_MAC_MOTION_FLUSH_MS",
         DEFAULT_MAC_MOTION_FLUSH_INTERVAL_MS
@@ -93,8 +115,9 @@ fn build_info() -> Result<()> {
     println!("mac_motion_mode default=coalesced env=SOFTKVM_MAC_MOTION_MODE");
     println!("cgevent_pointer_speed default=1.0 env=SOFTKVM_CGEVENT_POINTER_SPEED");
     println!("cgevent_motion_method default=event env=SOFTKVM_CGEVENT_MOTION_METHOD");
-    println!("cgevent_tap default=annotated-session env=SOFTKVM_CGEVENT_TAP");
-    println!("windows_udp_send_mode default=coalesced env=SOFTKVM_UDP_SEND_MODE");
+    println!("cgevent_tap default=session env=SOFTKVM_CGEVENT_TAP");
+    println!("mac_cgevent_motion_path event-driven-native-threads");
+    println!("windows_udp_send_mode default=immediate env=SOFTKVM_UDP_SEND_MODE");
     println!("mac_right_edge_release default=on env=SOFTKVM_MAC_RIGHT_EDGE_RELEASE");
     Ok(())
 }
@@ -397,13 +420,14 @@ impl MacMotionShared {
         self.release_requested.store(false, Ordering::Release);
     }
 
-    fn queue_motion(&self, packet: MotionDatagram) {
+    fn queue_motion(&self, packet: MotionDatagram) -> bool {
         if !self.remote_active.load(Ordering::Acquire) || (packet.dx == 0 && packet.dy == 0) {
-            return;
+            return false;
         }
         accumulate_motion(&self.pending_dx, packet.dx);
         accumulate_motion(&self.pending_dy, packet.dy);
         self.source_seq.store(packet.seq, Ordering::Release);
+        true
     }
 
     fn take_motion(&self) -> Option<(i32, i32, u64)> {
@@ -423,6 +447,41 @@ impl MacMotionShared {
     }
 }
 
+#[cfg(test)]
+mod mac_motion_tests {
+    use super::*;
+
+    #[test]
+    fn motion_accumulator_merges_without_replaying_a_backlog() {
+        let shared = MacMotionShared::default();
+        shared.set_remote_active(true);
+
+        assert!(shared.queue_motion(MotionDatagram {
+            seq: 10,
+            dx: 7,
+            dy: -3,
+        }));
+        assert!(shared.queue_motion(MotionDatagram {
+            seq: 11,
+            dx: 5,
+            dy: 9,
+        }));
+
+        assert_eq!(shared.take_motion(), Some((12, 6, 11)));
+        assert_eq!(shared.take_motion(), None);
+    }
+
+    #[test]
+    fn inactive_motion_is_dropped() {
+        let shared = MacMotionShared::default();
+        assert!(!shared.queue_motion(MotionDatagram {
+            seq: 1,
+            dx: 4,
+            dy: 0,
+        }));
+    }
+}
+
 fn accumulate_motion(cell: &AtomicI32, delta: i32) {
     let _ = cell.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
         Some(
@@ -439,6 +498,11 @@ async fn start_mac_motion_tasks(
     shared: Arc<MacMotionShared>,
     event_tx: mpsc::UnboundedSender<MacMotionEvent>,
 ) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if matches!(sink, SinkKind::CgEvent) {
+        return start_native_macos_motion_threads(socket, shared, event_tx);
+    }
+
     let motion_sink = make_sink(sink).await?;
     match mac_motion_mode(sink) {
         MacMotionMode::Direct => {
@@ -458,6 +522,158 @@ async fn start_mac_motion_tasks(
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn start_native_macos_motion_threads(
+    socket: UdpSocket,
+    shared: Arc<MacMotionShared>,
+    event_tx: mpsc::UnboundedSender<MacMotionEvent>,
+) -> Result<()> {
+    let socket = socket
+        .into_std()
+        .context("convert macOS UDP motion socket")?;
+    socket
+        .set_nonblocking(false)
+        .context("set macOS UDP motion socket blocking")?;
+    let receiver_shared = shared.clone();
+    let motion_sink = hid::CgEventMotionSink::connect()?;
+    let writer = std::thread::Builder::new()
+        .name("softkvm-mac-motion".to_owned())
+        .spawn(move || mac_native_motion_writer(motion_sink, shared, event_tx))
+        .context("spawn native macOS motion writer")?;
+    let writer_thread = writer.thread().clone();
+
+    std::thread::Builder::new()
+        .name("softkvm-mac-udp-recv".to_owned())
+        .spawn(move || mac_native_udp_receiver(socket, receiver_shared, writer_thread))
+        .context("spawn native macOS UDP receiver")?;
+
+    info!("using event-driven user-interactive macOS UDP motion threads");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn mac_native_udp_receiver(
+    socket: StdUdpSocket,
+    shared: Arc<MacMotionShared>,
+    writer_thread: std::thread::Thread,
+) {
+    platform::macos::prepare_low_latency_thread("UDP motion receiver");
+    let mut buffer = [0_u8; MOTION_DATAGRAM_LEN];
+    let mut last_recv_at: Option<Instant> = None;
+    let mut last_seq: Option<u64> = None;
+
+    loop {
+        let (len, addr) = match socket.recv_from(&mut buffer) {
+            Ok(result) => result,
+            Err(err) => {
+                warn!(?err, "native macOS UDP motion receiver failed");
+                return;
+            }
+        };
+        let received_at = Instant::now();
+        let Some(packet) = MotionDatagram::decode(&buffer[..len]) else {
+            warn!(%addr, len, "ignored malformed UDP motion packet");
+            continue;
+        };
+
+        if let Some(previous) = last_recv_at {
+            let gap = received_at.saturating_duration_since(previous);
+            if latency::report(gap) {
+                info!(
+                    target: "softkvm::latency",
+                    seq = packet.seq,
+                    previous_seq = last_seq,
+                    seq_gap = last_seq.map(|seq| packet.seq.saturating_sub(seq)),
+                    gap_ms = latency::ms(gap),
+                    "mac native UDP receive gap"
+                );
+            }
+        }
+        last_recv_at = Some(received_at);
+        last_seq = Some(packet.seq);
+
+        if shared.queue_motion(packet) {
+            writer_thread.unpark();
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_native_motion_writer(
+    mut motion_sink: hid::CgEventMotionSink,
+    shared: Arc<MacMotionShared>,
+    event_tx: mpsc::UnboundedSender<MacMotionEvent>,
+) {
+    platform::macos::prepare_low_latency_thread("CGEvent motion writer");
+    let mut right_edge_release_armed = false;
+    let mut was_active = false;
+
+    loop {
+        std::thread::park();
+
+        let active = shared.remote_active.load(Ordering::Acquire);
+        if active != was_active {
+            right_edge_release_armed = false;
+            was_active = active;
+        }
+        if !active {
+            continue;
+        }
+
+        let Some((dx, dy, source_seq)) = shared.take_motion() else {
+            continue;
+        };
+
+        if mac_right_edge_release_enabled()
+            && right_edge_release_armed
+            && dx > 0
+            && mac_cursor_at_right_edge()
+        {
+            if shared.request_release_once() {
+                let (_, y_ratio) = mac_cursor_ratios().unwrap_or((0.0, 0.5));
+                let _ = event_tx.send(MacMotionEvent::ReleaseHost {
+                    entry_y_ratio: Some(y_ratio),
+                });
+            }
+            continue;
+        }
+
+        let started = Instant::now();
+        if let Err(err) = motion_sink.apply_motion(dx, dy) {
+            warn!(?err, "native macOS motion injection failed");
+        }
+        let elapsed = started.elapsed();
+        if latency::report(elapsed) {
+            info!(
+                target: "softkvm::latency",
+                source_seq,
+                dx,
+                dy,
+                elapsed_ms = latency::ms(elapsed),
+                "mac event-driven motion apply latency"
+            );
+        }
+
+        if dx < 0
+            && mac_cursor_right_gap().is_some_and(|gap| gap >= MAC_RIGHT_EDGE_RELEASE_REARM_PX)
+        {
+            right_edge_release_armed = true;
+        }
+
+        if mac_right_edge_release_enabled()
+            && right_edge_release_armed
+            && dx > 0
+            && mac_cursor_at_right_edge()
+            && shared.request_release_once()
+        {
+            let (_, y_ratio) = mac_cursor_ratios().unwrap_or((0.0, 0.5));
+            let _ = event_tx.send(MacMotionEvent::ReleaseHost {
+                entry_y_ratio: Some(y_ratio),
+            });
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -22,26 +22,24 @@ Hard requirements:
 ```text
 Windows physical devices
   -> softkvm host, Win32 Raw Input
-  -> split local transport
+  -> immediate UDP motion + reliable TCP control
   -> softkvm macOS client
-  -> CGEvent injection
+  -> native receive thread -> thread unpark -> native CGEvent thread
   -> macOS input stack
 ```
 
 ## Latency Model
 
-The current production transport is reliable TCP with motion coalescing because
-it has shown better tail-latency in the local lab than UDP on this Mac. A split
-UDP motion plane still exists as an opt-in A/B path:
+The production path is split by semantics:
 
-- Default TCP frame stream: focus enter/leave, key events, mouse button events, scroll, all-up reset, and coalesced mouse motion.
-- Optional binary UDP datagrams on the same host/port: mouse motion (`SKM1`, `seq`, `dx`, `dy`) with `SOFTKVM_MOTION_TRANSPORT=udp`.
+- TCP frame stream: focus enter/leave, key events, mouse button events, scroll, and all-up reset.
+- Binary UDP datagrams on the same host/port: disposable mouse motion (`SKM1`, `seq`, `dx`, `dy`).
 
 Old mouse movement is disposable. Key/button/focus state is not disposable.
 The first activation motion rides the reliable stream after `HostState` so the
 macOS client cannot receive movement before it knows the remote side is active.
-Normal movement uses TCP coalescing by default; set `SOFTKVM_MOTION_TRANSPORT=udp`
-on Windows to test the disposable UDP path.
+Normal movement uses immediate UDP by default. `SOFTKVM_MOTION_TRANSPORT=tcp`
+keeps the old coalesced path available as a diagnostic fallback.
 
 Before sending any ordering-sensitive event such as key down/up, mouse button,
 wheel, focus enter, or focus leave, keep the reliable event on TCP. If the UDP
@@ -52,7 +50,8 @@ For 200 Hz displays:
 
 - Drain raw Windows mouse deltas at device rate.
 - Accumulate motion in a nonblocking hot path.
-- Coalesce movement at a small interval instead of replaying stale bursts.
+- Keep UDP receive independent from `CGEventPost`; if injection stalls, merge pending deltas and apply the newest accumulated movement once.
+- Wake the injector from packet arrival instead of a periodic Tokio/macOS timer.
 - Include an absolute logical cursor position or pointer sequence in reliable button events so clicks do not land at stale positions after dropped motion datagrams.
 
 ## MVP Order
@@ -60,7 +59,7 @@ For 200 Hz displays:
 1. Keep the CGEvent macOS receiver stable and measurable.
 2. Add dev transport and synthetic `probe` sender.
 3. Build Windows Raw Input host.
-4. Keep the binary UDP motion plane as an opt-in A/B path.
+4. Keep TCP motion as an explicit diagnostic fallback.
 5. Add startup installers and rollback commands.
 
 ## Input State
