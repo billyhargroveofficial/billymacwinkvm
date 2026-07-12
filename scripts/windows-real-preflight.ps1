@@ -46,22 +46,20 @@ if ($env:SOFTKVM_MOTION_TRANSPORT -eq "tcp") {
 }
 
 Write-Host ""
-Write-Host "== TCP to Mac =="
-$tcp = Test-NetConnection $peerHost -Port $peerPort
-$tcp | Select-Object ComputerName, RemoteAddress, TcpTestSucceeded | Format-List
-if (!$tcp.TcpTestSucceeded) {
-  throw "Cannot connect to $Peer. Start the Mac receiver or check firewall/LAN IP."
-}
-
-Write-Host ""
-Write-Host "== Synthetic probe =="
+Write-Host "== softkvm protocol probe =="
 & $Exe probe --peer $Peer
+if ($LASTEXITCODE -ne 0) {
+  throw "softkvm protocol probe failed for $Peer (exit $LASTEXITCODE). The error above includes the WinSock code."
+}
 
 Write-Host ""
 if ($RunHost) {
   Write-Host "== Real host =="
   Write-Host "Press Ctrl+C here to stop. Toggle remote mode with Ctrl+Alt+\."
   & $Exe host --peer $Peer --layout $Layout
+  if ($LASTEXITCODE -ne 0) {
+    throw "softkvm host exited with code $LASTEXITCODE."
+  }
 } else {
   Write-Host "PASS: preflight probe reached Mac."
   Write-Host "Next command for real host:"

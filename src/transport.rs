@@ -1,8 +1,60 @@
 use crate::protocol::Frame;
+use std::io;
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::time::sleep;
+use tracing::warn;
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+pub async fn connect_tcp_with_retry(
+    peer: &str,
+    attempts: usize,
+    retry_delay: Duration,
+) -> Result<TcpStream> {
+    let attempts = attempts.max(1);
+    let mut last_error = None;
+
+    for attempt in 1..=attempts {
+        match TcpStream::connect(peer).await {
+            Ok(stream) => {
+                if attempt > 1 {
+                    tracing::info!(%peer, attempt, "TCP connection recovered");
+                }
+                return Ok(stream);
+            }
+            Err(err) => {
+                warn!(
+                    %peer,
+                    attempt,
+                    attempts,
+                    error = %err,
+                    error_kind = ?err.kind(),
+                    raw_os_error = ?err.raw_os_error(),
+                    "TCP connect failed"
+                );
+                last_error = Some(err);
+                if attempt < attempts {
+                    sleep(retry_delay).await;
+                }
+            }
+        }
+    }
+
+    let err = last_error.expect("at least one TCP connection attempt");
+    bail!(connect_error_message(peer, attempts, &err))
+}
+
+fn connect_error_message(peer: &str, attempts: usize, err: &io::Error) -> String {
+    format!(
+        "connect {peer} failed after {attempts} attempts: {err} (kind={:?}, raw_os_error={:?})",
+        err.kind(),
+        err.raw_os_error()
+    )
+}
 
 pub struct FrameReader<R> {
     stream: R,
@@ -75,6 +127,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use tokio::net::{TcpListener, TcpStream};
     use uuid::Uuid;
 
@@ -136,5 +190,29 @@ mod tests {
         assert!(reader.read_frame().await?.is_none());
         sender.await??;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn retry_connector_reaches_listener() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let peer = addr.to_string();
+
+        let connected = connect_tcp_with_retry(&peer, 3, Duration::from_millis(1));
+        let (client, accepted) = tokio::join!(connected, listener.accept());
+
+        let _client = client?;
+        let (_server, _) = accepted?;
+        Ok(())
+    }
+
+    #[test]
+    fn connect_error_includes_os_details() {
+        let error = io::Error::from_raw_os_error(61);
+        let message = connect_error_message("192.0.2.1:49321", 8, &error);
+
+        assert!(message.contains("192.0.2.1:49321"));
+        assert!(message.contains("8 attempts"));
+        assert!(message.contains("raw_os_error=Some(61)"));
     }
 }

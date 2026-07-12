@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::net::{
-    TcpStream, UdpSocket,
+    UdpSocket,
     tcp::{OwnedReadHalf, OwnedWriteHalf},
 };
 use tokio::sync::mpsc;
@@ -1379,9 +1379,7 @@ async fn reset_input(hid_sink: &mut Box<dyn HidSink>, sink: SinkKind) {
 }
 
 async fn run_probe(peer: String) -> Result<()> {
-    let stream = TcpStream::connect(&peer)
-        .await
-        .with_context(|| format!("connect {peer}"))?;
+    let stream = transport::connect_tcp_with_retry(&peer, 8, Duration::from_millis(250)).await?;
     stream.set_nodelay(true).context("set TCP_NODELAY")?;
     let mut writer = transport::FrameWriter::new(stream);
     let session_id = Uuid::new_v4();
@@ -1447,9 +1445,7 @@ async fn run_motion_bench(
 ) -> Result<()> {
     bail_if_invalid_bench(hz, seconds)?;
 
-    let stream = TcpStream::connect(&peer)
-        .await
-        .with_context(|| format!("connect {peer}"))?;
+    let stream = transport::connect_tcp_with_retry(&peer, 8, Duration::from_millis(250)).await?;
     stream.set_nodelay(true).context("set TCP_NODELAY")?;
     let udp = if matches!(bench_transport, BenchTransport::Udp) {
         let socket = StdUdpSocket::bind("0.0.0.0:0").context("bind udp bench")?;

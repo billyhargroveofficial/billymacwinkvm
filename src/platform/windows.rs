@@ -9,7 +9,6 @@ use std::thread;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
-use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, MissedTickBehavior, interval};
@@ -126,9 +125,8 @@ pub async fn run_host(
     let local_mouse_capture = !no_local_capture;
     LOCAL_MOUSE_CAPTURE_FAST.store(local_mouse_capture, Ordering::Relaxed);
 
-    let stream = TcpStream::connect(&peer)
-        .await
-        .with_context(|| format!("connect {peer}"))?;
+    let stream =
+        crate::transport::connect_tcp_with_retry(&peer, 40, Duration::from_millis(250)).await?;
     stream.set_nodelay(true).context("set TCP_NODELAY")?;
     let motion_transport = MotionTransport::connect(&peer).await;
     let direct_motion = motion_transport.direct_writer();
