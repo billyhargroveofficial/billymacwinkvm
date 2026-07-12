@@ -125,6 +125,9 @@ pub async fn run_host(
     let local_mouse_capture = !no_local_capture;
     LOCAL_MOUSE_CAPTURE_FAST.store(local_mouse_capture, Ordering::Relaxed);
 
+    crate::trace::init("win-host");
+    crate::trace::start_freeze_detector();
+
     let stream =
         crate::transport::connect_tcp_with_retry(&peer, 40, Duration::from_millis(250)).await?;
     stream.set_nodelay(true).context("set TCP_NODELAY")?;
@@ -693,13 +696,38 @@ impl SharedUdpMotionWriter {
             seq: self.seq.fetch_add(1, Ordering::Relaxed),
             dx: dx.clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH),
             dy: dy.clamp(-MAX_MOTION_DELTA_PER_FLUSH, MAX_MOTION_DELTA_PER_FLUSH),
+            t_send_us: crate::trace::now_us() as u32,
         };
-        let encoded = packet.encode();
+        // SKM2 (with the sender stamp) only while tracing, so untraced runs
+        // keep the exact SKM1 wire format older clients expect.
+        let encoded_v2;
+        let encoded_v1;
+        let encoded: &[u8] = if crate::trace::enabled() {
+            encoded_v2 = packet.encode_v2();
+            &encoded_v2
+        } else {
+            encoded_v1 = packet.encode();
+            &encoded_v1
+        };
         let started = Instant::now();
+        crate::trace::stamp(
+            crate::trace::Stage::WinUdpPre,
+            packet.seq,
+            packet.dx,
+            packet.dy,
+            0,
+        );
         let sent = self
             .socket
-            .send(&encoded)
+            .send(encoded)
             .context("send udp motion packet")?;
+        crate::trace::stamp(
+            crate::trace::Stage::WinUdpPost,
+            packet.seq,
+            packet.dx,
+            packet.dy,
+            0,
+        );
         if sent != encoded.len() {
             bail!("short udp motion send: {sent}/{}", encoded.len());
         }
@@ -1447,6 +1475,14 @@ fn fast_direct_motion_writer() -> Option<&'static SharedUdpMotionWriter> {
     DIRECT_MOTION_FAST.get()
 }
 
+/// Keep the lock-free flag and the trace session marker in step.
+fn set_remote_active_fast(active: bool) {
+    REMOTE_ACTIVE_FAST.store(active, Ordering::Relaxed);
+    crate::trace::set_active(active);
+}
+
+static RAW_MOUSE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn handle_mouse(raw: RAWINPUT) -> Result<()> {
     let started = Instant::now();
     let mouse = unsafe { raw.data.mouse };
@@ -1454,6 +1490,15 @@ fn handle_mouse(raw: RAWINPUT) -> Result<()> {
     let flags = u32::from(buttons.usButtonFlags);
     let dx = mouse.lLastX;
     let dy = mouse.lLastY;
+    if dx != 0 || dy != 0 || flags != 0 {
+        crate::trace::stamp(
+            crate::trace::Stage::WinRawIn,
+            RAW_MOUSE_COUNTER.fetch_add(1, Ordering::Relaxed),
+            dx,
+            dy,
+            flags,
+        );
+    }
 
     if REMOTE_ACTIVE_FAST.load(Ordering::Relaxed) && flags == 0 && (dx != 0 || dy != 0) {
         if let Some(writer) = fast_direct_motion_writer() {
@@ -1709,7 +1754,7 @@ unsafe fn cleanup_host_state() {
         state.release_local_controls(true, None, None);
         state.uninstall_hooks();
         state.remote_active = false;
-        REMOTE_ACTIVE_FAST.store(false, Ordering::Relaxed);
+        set_remote_active_fast(false);
         LOCAL_MOUSE_CAPTURE_FAST.store(true, Ordering::Relaxed);
         state.left_edge_armed = false;
         return;
@@ -1727,7 +1772,7 @@ fn release_host_state_after_transport_loss(reason: &'static str) {
                 warn!(reason, "transport lost; releasing local Windows controls");
             }
             state.remote_active = false;
-            REMOTE_ACTIVE_FAST.store(false, Ordering::Relaxed);
+            set_remote_active_fast(false);
             LOCAL_MOUSE_CAPTURE_FAST.store(true, Ordering::Relaxed);
             state.left_edge_armed = false;
             state.pressed_modifier_keys.clear();
@@ -1754,6 +1799,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         && REMOTE_ACTIVE_FAST.load(Ordering::Relaxed)
         && LOCAL_MOUSE_CAPTURE_FAST.load(Ordering::Relaxed)
     {
+        crate::trace::stamp(crate::trace::Stage::WinHook, 0, 0, 0, wparam.0 as u32);
         return LRESULT(1);
     }
 
@@ -1957,7 +2003,7 @@ impl HostState {
             let capture_started = Instant::now();
             if let Err(err) = self.capture_local_controls() {
                 self.remote_active = false;
-                REMOTE_ACTIVE_FAST.store(false, Ordering::Relaxed);
+                set_remote_active_fast(false);
                 LOCAL_MOUSE_CAPTURE_FAST.store(true, Ordering::Relaxed);
                 self.release_local_controls(false, None, None);
                 self.left_edge_armed = false;
@@ -1965,7 +2011,7 @@ impl HostState {
             }
             let capture_elapsed = capture_started.elapsed();
             self.remote_active = true;
-            REMOTE_ACTIVE_FAST.store(true, Ordering::Relaxed);
+            set_remote_active_fast(true);
             LOCAL_MOUSE_CAPTURE_FAST.store(self.local_mouse_capture, Ordering::Relaxed);
             self.left_edge_armed = false;
             let send_state_started = Instant::now();
@@ -1982,7 +2028,7 @@ impl HostState {
             };
             if let Err(err) = send_result {
                 self.remote_active = false;
-                REMOTE_ACTIVE_FAST.store(false, Ordering::Relaxed);
+                set_remote_active_fast(false);
                 LOCAL_MOUSE_CAPTURE_FAST.store(true, Ordering::Relaxed);
                 self.release_local_controls(true, None, None);
                 return Err(err);
@@ -1991,7 +2037,7 @@ impl HostState {
             let modifiers_started = Instant::now();
             if let Err(err) = self.send_current_modifier_state() {
                 self.remote_active = false;
-                REMOTE_ACTIVE_FAST.store(false, Ordering::Relaxed);
+                set_remote_active_fast(false);
                 LOCAL_MOUSE_CAPTURE_FAST.store(true, Ordering::Relaxed);
                 self.release_local_controls(true, None, None);
                 return Err(err);
@@ -2010,7 +2056,7 @@ impl HostState {
             info!(reason, "remote macOS control enabled");
         } else {
             self.remote_active = false;
-            REMOTE_ACTIVE_FAST.store(false, Ordering::Relaxed);
+            set_remote_active_fast(false);
             LOCAL_MOUSE_CAPTURE_FAST.store(true, Ordering::Relaxed);
             self.left_edge_armed = false;
             self.release_local_controls(true, entry_x_ratio, entry_y_ratio);

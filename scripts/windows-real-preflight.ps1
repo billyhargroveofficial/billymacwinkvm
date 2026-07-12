@@ -6,7 +6,11 @@ param(
 
   [string]$Layout = "mac-left",
 
-  [switch]$RunHost
+  [switch]$RunHost,
+
+  # Enable ring-buffer freeze tracing (see docs/freeze-tracing-guide.md).
+  # Requires a v0016+ client on the Mac while active (SKM2 datagrams).
+  [switch]$Trace
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,6 +18,10 @@ $ProgressPreference = "SilentlyContinue"
 $env:RUST_LOG = if ($env:RUST_LOG) { $env:RUST_LOG } else { "softkvm=info" }
 $env:SOFTKVM_MOTION_TRANSPORT = if ($env:SOFTKVM_MOTION_TRANSPORT) { $env:SOFTKVM_MOTION_TRANSPORT } else { "udp" }
 $env:SOFTKVM_UDP_SEND_MODE = if ($env:SOFTKVM_UDP_SEND_MODE) { $env:SOFTKVM_UDP_SEND_MODE } else { "immediate" }
+if ($Trace) {
+  $env:SOFTKVM_TRACE = "1"
+  Write-Host ("Freeze tracing: ON, dumps in {0}\softkvm-trace (flush by toggling remote off)" -f $env:TEMP)
+}
 
 if (!(Test-Path $Exe)) {
   throw "softkvm executable not found: $Exe"

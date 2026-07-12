@@ -55,6 +55,40 @@ pub enum Command {
         dx: i32,
     },
 
+    /// macOS-only: drive the exact CGEvent writer from a local synthetic
+    /// source (no network) and report per-stage stall statistics. Uses
+    /// alternating +/-amp deltas so the cursor stays roughly in place.
+    MacCgBench {
+        #[arg(long, default_value_t = 20)]
+        seconds: u32,
+
+        #[arg(long, default_value_t = 250)]
+        hz: u32,
+
+        /// Delta magnitude in pixels for each alternating step.
+        #[arg(long, default_value_t = 1)]
+        amp: i32,
+
+        /// Also write a binary .sktrace dump for offline analysis.
+        #[arg(long)]
+        dump: bool,
+    },
+
+    /// Analyze .sktrace ring dumps (one file, or a Windows + macOS pair for
+    /// cross-machine freeze correlation by sequence number).
+    TraceAnalyze {
+        /// Dump files produced with SOFTKVM_TRACE=1 (freeze/session-end dumps).
+        files: Vec<std::path::PathBuf>,
+
+        /// Gap threshold in milliseconds to count as a stall.
+        #[arg(long, default_value_t = 100.0)]
+        stall_ms: f64,
+
+        /// How many worst stalls to print.
+        #[arg(long, default_value_t = 25)]
+        top: usize,
+    },
+
     /// Measure real Windows Raw Input cadence without involving macOS.
     WinRawCadence {
         #[arg(long, default_value_t = 60)]

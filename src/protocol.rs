@@ -3,7 +3,13 @@ use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u16 = 0;
 pub const MOTION_DATAGRAM_LEN: usize = 24;
+/// SKM2 appends a 32-bit sender monotonic-microsecond stamp used for
+/// delay-variation tracing. Receivers accept both formats; the sender emits
+/// SKM2 only while SOFTKVM_TRACE is enabled, so untraced runs are unchanged.
+pub const MOTION_DATAGRAM_V2_LEN: usize = 32;
+pub const MOTION_DATAGRAM_MAX_LEN: usize = MOTION_DATAGRAM_V2_LEN;
 const MOTION_DATAGRAM_MAGIC: &[u8; 4] = b"SKM1";
+const MOTION_DATAGRAM_MAGIC_V2: &[u8; 4] = b"SKM2";
 const MOTION_DATAGRAM_TYPE_MOUSE_MOTION: u8 = 1;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -150,9 +156,23 @@ pub struct MotionDatagram {
     pub seq: u64,
     pub dx: i32,
     pub dy: i32,
+    /// Sender monotonic clock, low 32 bits of microseconds. 0 when unknown
+    /// (SKM1 sender or tracing disabled). Wraps every ~71.6 minutes; the
+    /// analyzer subtracts wrap-aware.
+    pub t_send_us: u32,
 }
 
 impl MotionDatagram {
+    #[cfg_attr(not(any(test, windows)), allow(dead_code))]
+    pub fn new(seq: u64, dx: i32, dy: i32) -> Self {
+        Self {
+            seq,
+            dx,
+            dy,
+            t_send_us: 0,
+        }
+    }
+
     #[cfg_attr(not(any(test, windows)), allow(dead_code))]
     pub fn encode(self) -> [u8; MOTION_DATAGRAM_LEN] {
         let mut out = [0_u8; MOTION_DATAGRAM_LEN];
@@ -164,13 +184,34 @@ impl MotionDatagram {
         out
     }
 
+    #[cfg_attr(not(any(test, windows)), allow(dead_code))]
+    pub fn encode_v2(self) -> [u8; MOTION_DATAGRAM_V2_LEN] {
+        let mut out = [0_u8; MOTION_DATAGRAM_V2_LEN];
+        out[0..4].copy_from_slice(MOTION_DATAGRAM_MAGIC_V2);
+        out[4] = MOTION_DATAGRAM_TYPE_MOUSE_MOTION;
+        out[8..16].copy_from_slice(&self.seq.to_le_bytes());
+        out[16..20].copy_from_slice(&self.dx.to_le_bytes());
+        out[20..24].copy_from_slice(&self.dy.to_le_bytes());
+        out[24..28].copy_from_slice(&self.t_send_us.to_le_bytes());
+        out
+    }
+
     pub fn decode(input: &[u8]) -> Option<Self> {
-        if input.len() != MOTION_DATAGRAM_LEN {
-            return None;
-        }
-        if &input[0..4] != MOTION_DATAGRAM_MAGIC {
-            return None;
-        }
+        let t_send_us = match input.len() {
+            MOTION_DATAGRAM_LEN => {
+                if &input[0..4] != MOTION_DATAGRAM_MAGIC {
+                    return None;
+                }
+                0
+            }
+            MOTION_DATAGRAM_V2_LEN => {
+                if &input[0..4] != MOTION_DATAGRAM_MAGIC_V2 {
+                    return None;
+                }
+                u32::from_le_bytes(input[24..28].try_into().ok()?)
+            }
+            _ => return None,
+        };
         if input[4] != MOTION_DATAGRAM_TYPE_MOUSE_MOTION {
             return None;
         }
@@ -178,7 +219,12 @@ impl MotionDatagram {
         let seq = u64::from_le_bytes(input[8..16].try_into().ok()?);
         let dx = i32::from_le_bytes(input[16..20].try_into().ok()?);
         let dy = i32::from_le_bytes(input[20..24].try_into().ok()?);
-        Some(Self { seq, dx, dy })
+        Some(Self {
+            seq,
+            dx,
+            dy,
+            t_send_us,
+        })
     }
 }
 
@@ -188,25 +234,43 @@ mod motion_tests {
 
     #[test]
     fn motion_datagram_round_trips() {
+        let packet = MotionDatagram::new(42, -17, 23);
+        assert_eq!(MotionDatagram::decode(&packet.encode()), Some(packet));
+    }
+
+    #[test]
+    fn motion_datagram_v2_round_trips_with_send_stamp() {
         let packet = MotionDatagram {
             seq: 42,
             dx: -17,
             dy: 23,
+            t_send_us: 0xdead_beef,
         };
-        assert_eq!(MotionDatagram::decode(&packet.encode()), Some(packet));
+        assert_eq!(MotionDatagram::decode(&packet.encode_v2()), Some(packet));
+    }
+
+    #[test]
+    fn motion_datagram_v1_decodes_without_send_stamp() {
+        let packet = MotionDatagram {
+            seq: 7,
+            dx: 1,
+            dy: 2,
+            t_send_us: 999,
+        };
+        let decoded = MotionDatagram::decode(&packet.encode()).expect("v1 decode");
+        assert_eq!(decoded.t_send_us, 0);
+        assert_eq!((decoded.seq, decoded.dx, decoded.dy), (7, 1, 2));
     }
 
     #[test]
     fn motion_datagram_rejects_bad_input() {
         assert_eq!(MotionDatagram::decode(&[]), None);
-        let mut packet = MotionDatagram {
-            seq: 1,
-            dx: 2,
-            dy: 3,
-        }
-        .encode();
+        let mut packet = MotionDatagram::new(1, 2, 3).encode();
         packet[0] = b'X';
         assert_eq!(MotionDatagram::decode(&packet), None);
+        let mut packet_v2 = MotionDatagram::new(1, 2, 3).encode_v2();
+        packet_v2[3] = b'9';
+        assert_eq!(MotionDatagram::decode(&packet_v2), None);
     }
 }
 

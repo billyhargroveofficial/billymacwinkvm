@@ -88,8 +88,8 @@ impl CgEventMotionSink {
         })
     }
 
-    pub fn apply_motion(&mut self, dx: i32, dy: i32) -> Result<()> {
-        self.inner.post_motion(dx, dy)
+    pub fn apply_motion(&mut self, dx: i32, dy: i32, source_seq: u64) -> Result<()> {
+        self.inner.post_motion_traced(dx, dy, source_seq)
     }
 }
 
@@ -233,6 +233,10 @@ impl CgEventSink {
     }
 
     fn post_motion(&self, dx: i32, dy: i32) -> Result<()> {
+        self.post_motion_traced(dx, dy, 0)
+    }
+
+    fn post_motion_traced(&self, dx: i32, dy: i32, source_seq: u64) -> Result<()> {
         let Some(point) = Self::advance_position(dx, dy) else {
             bail!("CGEventCreate returned null while reading mouse position");
         };
@@ -247,14 +251,22 @@ impl CgEventSink {
             CG_EVENT_MOUSE_MOVED
         };
         if buttons == 0 && cgevent_motion_method() == CgEventMotionMethod::Warp {
-            return Self::post_warp_motion(point);
+            return Self::post_warp_motion(point, source_seq);
         }
-        self.post_mouse_event(event_type, point, CG_MOUSE_BUTTON_LEFT, Some((dx, dy)))
+        self.post_mouse_event_traced(
+            event_type,
+            point,
+            CG_MOUSE_BUTTON_LEFT,
+            Some((dx, dy)),
+            source_seq,
+        )
     }
 
-    fn post_warp_motion(point: CGPoint) -> Result<()> {
+    fn post_warp_motion(point: CGPoint, source_seq: u64) -> Result<()> {
         let started = Instant::now();
+        crate::trace::stamp(crate::trace::Stage::MacPostPre, source_seq, 0, 0, 0);
         let status = unsafe { CGWarpMouseCursorPosition(point) };
+        crate::trace::stamp(crate::trace::Stage::MacPostPost, source_seq, 0, 0, 0);
         let elapsed = started.elapsed();
         if status != 0 {
             bail!("CGWarpMouseCursorPosition failed: {status}");
@@ -312,6 +324,18 @@ impl CgEventSink {
         button: u32,
         delta: Option<(i32, i32)>,
     ) -> Result<()> {
+        self.post_mouse_event_traced(event_type, point, button, delta, 0)
+    }
+
+    fn post_mouse_event_traced(
+        &self,
+        event_type: u32,
+        point: CGPoint,
+        button: u32,
+        delta: Option<(i32, i32)>,
+        source_seq: u64,
+    ) -> Result<()> {
+        let (trace_dx, trace_dy) = delta.unwrap_or((0, 0));
         let started = Instant::now();
         let event = unsafe { CGEventCreateMouseEvent(std::ptr::null(), event_type, point, button) };
         if event.is_null() {
@@ -325,11 +349,32 @@ impl CgEventSink {
             CGEventSetFlags(event, self.modifiers);
         }
         let create_elapsed = started.elapsed();
+        crate::trace::stamp(
+            crate::trace::Stage::MacEvtCreated,
+            source_seq,
+            trace_dx,
+            trace_dy,
+            0,
+        );
         let post_started = Instant::now();
+        crate::trace::stamp(
+            crate::trace::Stage::MacPostPre,
+            source_seq,
+            trace_dx,
+            trace_dy,
+            0,
+        );
         unsafe {
             CGEventPost(cgevent_tap().value(), event);
             CFRelease(event.cast_const());
         }
+        crate::trace::stamp(
+            crate::trace::Stage::MacPostPost,
+            source_seq,
+            trace_dx,
+            trace_dy,
+            0,
+        );
         let post_elapsed = post_started.elapsed();
         let total_elapsed = started.elapsed();
         if latency::report(total_elapsed) {

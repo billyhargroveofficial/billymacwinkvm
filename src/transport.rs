@@ -36,6 +36,20 @@ pub async fn connect_tcp_with_retry(
                     raw_os_error = ?err.raw_os_error(),
                     "TCP connect failed"
                 );
+                if err.kind() == io::ErrorKind::AddrInUse && attempt == 1 {
+                    // Outbound connect() failing with WSAEADDRINUSE/EADDRINUSE
+                    // means the OS could not allocate a local ephemeral port:
+                    // exhausted/shrunken dynamic range, port-exclusion ranges
+                    // (Hyper-V/WSL/Defender), or a duplicate instance storm.
+                    // Retrying rarely helps; diagnose instead.
+                    warn!(
+                        "local ephemeral port allocation failed (AddrInUse on outbound connect); \
+                         on Windows run scripts/diagnose-addrinuse.ps1: check \
+                         `netsh int ipv4 show dynamicport tcp`, \
+                         `netsh int ipv4 show excludedportrange tcp`, TIME_WAIT counts, \
+                         and duplicate softkvm processes"
+                    );
+                }
                 last_error = Some(err);
                 if attempt < attempts {
                     sleep(retry_delay).await;

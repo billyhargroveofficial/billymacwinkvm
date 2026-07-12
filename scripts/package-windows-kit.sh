@@ -53,7 +53,9 @@ mkdir -p "$stage_dir/scripts" "$stage_dir/docs"
 cp "target/$X64_TARGET/release/softkvm.exe" "$stage_dir/softkvm.exe"
 cp "target/$ARM64_TARGET/release/softkvm.exe" "$stage_dir/softkvm-arm64.exe"
 cp scripts/windows-real-preflight.ps1 "$stage_dir/scripts/windows-real-preflight.ps1"
+cp scripts/diagnose-addrinuse.ps1 "$stage_dir/scripts/diagnose-addrinuse.ps1"
 cp docs/test-plan.md "$stage_dir/docs/test-plan.md"
+cp docs/freeze-tracing-guide.md "$stage_dir/docs/freeze-tracing-guide.md"
 
 cat >"$stage_dir/VERSION.txt" <<EOF
 softkvm_windows_test_kit=$version_tag
@@ -98,6 +100,28 @@ Diagnose real Windows mouse cadence before involving macOS:
 .\\softkvm.exe win-raw-cadence --seconds 30 --mode raw-only
 .\\softkvm.exe win-raw-cadence --seconds 30 --mode hooks-passive
 .\\softkvm.exe win-raw-cadence --seconds 30 --mode hooks-suppress
+
+Freeze tracing (docs/freeze-tracing-guide.md, needs v0016+ on BOTH machines):
+
+.\\scripts\\windows-real-preflight.ps1 -Exe .\\softkvm.exe -Peer "<mac-ip>:49321" -RunHost -Trace
+
+Move on the Mac until several freezes happen, then toggle control back to
+Windows (right edge / Ctrl+Alt+\\) to flush ring dumps on both sides.
+Dumps: %TEMP%\\softkvm-trace on Windows, /tmp/softkvm-trace on the Mac.
+Analyze (either machine):
+
+.\\softkvm.exe trace-analyze <mac-dump> <win-dump> --stall-ms 100
+
+During a freezy session you can also run an independent Raw Input observer
+in a SECOND console; if it shows no gaps while the cursor freezes, the
+mouse/USB side is exonerated:
+
+.\\softkvm.exe win-raw-cadence --seconds 120 --mode raw-only
+
+If 'probe' fails with os error 10048 (AddrInUse), that is a LOCAL ephemeral
+port problem, not the Mac refusing:
+
+powershell -ExecutionPolicy Bypass -File .\\scripts\\diagnose-addrinuse.ps1
 EOF
 
 rm -f "$zip_path" "$latest_zip"

@@ -3,6 +3,8 @@ mod hid;
 mod latency;
 mod platform;
 mod protocol;
+mod trace;
+mod trace_analyze;
 mod transport;
 
 use anyhow::{Context, Result, bail};
@@ -10,7 +12,7 @@ use clap::Parser;
 use cli::{BenchTiming, BenchTransport, Cli, Command, SinkKind, WinRawCadenceMode};
 use hid::{HidSink, LogSink};
 use protocol::{
-    ClientControlEvent, Frame, InputEvent, KeyCode, KeyState, MOTION_DATAGRAM_LEN, Message,
+    ClientControlEvent, Frame, InputEvent, KeyCode, KeyState, MOTION_DATAGRAM_MAX_LEN, Message,
     Modifier, MotionDatagram, MouseButton, ProtocolHello,
 };
 use std::collections::HashSet;
@@ -71,8 +73,25 @@ async fn run(cli: Cli) -> Result<()> {
         Command::BuildInfo => build_info(),
         Command::GenPsk => gen_psk(),
         Command::MacNativeHidProbe => mac_native_hid_probe().await,
-        Command::Client { listen, sink } => run_client(listen, sink).await,
+        Command::Client { listen, sink } => {
+            trace::init("mac-client");
+            trace::start_freeze_detector();
+            #[cfg(target_os = "macos")]
+            trace::observer::start_if_requested();
+            run_client(listen, sink).await
+        }
         Command::Probe { peer } => run_probe(peer).await,
+        Command::MacCgBench {
+            seconds,
+            hz,
+            amp,
+            dump,
+        } => run_mac_cg_bench(seconds, hz, amp, dump),
+        Command::TraceAnalyze {
+            files,
+            stall_ms,
+            top,
+        } => trace_analyze::run(files, stall_ms, top),
         Command::MotionBench {
             peer,
             transport,
@@ -418,6 +437,7 @@ impl MacMotionShared {
         self.pending_dx.store(0, Ordering::Release);
         self.pending_dy.store(0, Ordering::Release);
         self.release_requested.store(false, Ordering::Release);
+        trace::set_active(active);
     }
 
     fn queue_motion(&self, packet: MotionDatagram) -> bool {
@@ -456,16 +476,8 @@ mod mac_motion_tests {
         let shared = MacMotionShared::default();
         shared.set_remote_active(true);
 
-        assert!(shared.queue_motion(MotionDatagram {
-            seq: 10,
-            dx: 7,
-            dy: -3,
-        }));
-        assert!(shared.queue_motion(MotionDatagram {
-            seq: 11,
-            dx: 5,
-            dy: 9,
-        }));
+        assert!(shared.queue_motion(MotionDatagram::new(10, 7, -3)));
+        assert!(shared.queue_motion(MotionDatagram::new(11, 5, 9)));
 
         assert_eq!(shared.take_motion(), Some((12, 6, 11)));
         assert_eq!(shared.take_motion(), None);
@@ -474,11 +486,7 @@ mod mac_motion_tests {
     #[test]
     fn inactive_motion_is_dropped() {
         let shared = MacMotionShared::default();
-        assert!(!shared.queue_motion(MotionDatagram {
-            seq: 1,
-            dx: 4,
-            dy: 0,
-        }));
+        assert!(!shared.queue_motion(MotionDatagram::new(1, 4, 0)));
     }
 }
 
@@ -560,7 +568,7 @@ fn mac_native_udp_receiver(
     writer_thread: std::thread::Thread,
 ) {
     platform::macos::prepare_low_latency_thread("UDP motion receiver");
-    let mut buffer = [0_u8; MOTION_DATAGRAM_LEN];
+    let mut buffer = [0_u8; MOTION_DATAGRAM_MAX_LEN];
     let mut last_recv_at: Option<Instant> = None;
     let mut last_seq: Option<u64> = None;
 
@@ -577,6 +585,13 @@ fn mac_native_udp_receiver(
             warn!(%addr, len, "ignored malformed UDP motion packet");
             continue;
         };
+        trace::stamp(
+            trace::Stage::MacRecv,
+            packet.seq,
+            packet.dx,
+            packet.dy,
+            packet.t_send_us,
+        );
 
         if let Some(previous) = last_recv_at {
             let gap = received_at.saturating_duration_since(previous);
@@ -595,6 +610,7 @@ fn mac_native_udp_receiver(
         last_seq = Some(packet.seq);
 
         if shared.queue_motion(packet) {
+            trace::stamp(trace::Stage::MacQueued, packet.seq, packet.dx, packet.dy, 0);
             writer_thread.unpark();
         }
     }
@@ -612,6 +628,7 @@ fn mac_native_motion_writer(
 
     loop {
         std::thread::park();
+        trace::stamp(trace::Stage::MacWake, 0, 0, 0, 0);
 
         let active = shared.remote_active.load(Ordering::Acquire);
         if active != was_active {
@@ -625,6 +642,7 @@ fn mac_native_motion_writer(
         let Some((dx, dy, source_seq)) = shared.take_motion() else {
             continue;
         };
+        trace::stamp(trace::Stage::MacTake, source_seq, dx, dy, 0);
 
         if mac_right_edge_release_enabled()
             && right_edge_release_armed
@@ -641,7 +659,7 @@ fn mac_native_motion_writer(
         }
 
         let started = Instant::now();
-        if let Err(err) = motion_sink.apply_motion(dx, dy) {
+        if let Err(err) = motion_sink.apply_motion(dx, dy, source_seq) {
             warn!(?err, "native macOS motion injection failed");
         }
         let elapsed = started.elapsed();
@@ -722,7 +740,7 @@ async fn mac_udp_motion_direct_task(
     shared: Arc<MacMotionShared>,
     event_tx: mpsc::UnboundedSender<MacMotionEvent>,
 ) {
-    let mut buffer = [0_u8; MOTION_DATAGRAM_LEN];
+    let mut buffer = [0_u8; MOTION_DATAGRAM_MAX_LEN];
     let mut right_edge_release_armed = false;
     let mut was_active = false;
     let mut last_recv_at: Option<Instant> = None;
@@ -826,7 +844,7 @@ async fn mac_udp_motion_direct_task(
 }
 
 async fn mac_udp_motion_accumulator_task(socket: UdpSocket, shared: Arc<MacMotionShared>) {
-    let mut buffer = [0_u8; MOTION_DATAGRAM_LEN];
+    let mut buffer = [0_u8; MOTION_DATAGRAM_MAX_LEN];
     loop {
         match socket.recv_from(&mut buffer).await {
             Ok((len, addr)) => {
@@ -1444,6 +1462,9 @@ async fn run_motion_bench(
     dx: i32,
 ) -> Result<()> {
     bail_if_invalid_bench(hz, seconds)?;
+    // Anchor the monotonic clock so SKM2 packets carry a real sender stamp.
+    // Requires a client built with SKM2 support (kit v0016+) on the far side.
+    trace::init_forced("bench");
 
     let stream = transport::connect_tcp_with_retry(&peer, 8, Duration::from_millis(250)).await?;
     stream.set_nodelay(true).context("set TCP_NODELAY")?;
@@ -1508,8 +1529,11 @@ async fn run_motion_bench(
                     seq: i + 1,
                     dx: event_dx,
                     dy: 0,
+                    t_send_us: trace::now_us() as u32,
                 };
-                let encoded = packet.encode();
+                // SKM2 keeps a sender stamp flowing so the client's analyzer
+                // can compute in-flight delay variation for bench runs too.
+                let encoded = packet.encode_v2();
                 let sent = socket
                     .send(&encoded)
                     .context("send udp motion bench packet")?;
@@ -1623,6 +1647,77 @@ async fn run_host(
             "host capture is Windows-only for the first MVP; use `probe` from macOS for client testing"
         )
     }
+}
+
+/// A/B test #4 from the freeze investigation: local synthetic source feeding
+/// the exact CGEvent writer used by the live UDP path, no network involved.
+/// Alternating +/-amp deltas keep the visible cursor essentially in place.
+/// If ~0.5 s stalls exist here, CGEventPost/WindowServer is implicated; if
+/// this is clean while real sessions freeze, the cause is upstream.
+#[cfg(target_os = "macos")]
+fn run_mac_cg_bench(seconds: u32, hz: u32, amp: i32, dump: bool) -> Result<()> {
+    bail_if_invalid_bench(hz, seconds)?;
+    let amp = amp.clamp(1, 32);
+    trace::init_forced("bench");
+    #[cfg(target_os = "macos")]
+    trace::observer::start_if_requested();
+    platform::macos::prepare_low_latency_thread("cg bench");
+
+    let mut sink = hid::CgEventMotionSink::connect()?;
+    let total = u64::from(hz) * u64::from(seconds);
+    let period = std::time::Duration::from_secs_f64(1.0 / f64::from(hz));
+    println!(
+        "mac-cg-bench: {total} posts at {hz} Hz for {seconds}s, amp={amp}px (alternating), method/tap from env"
+    );
+
+    trace::set_active(true);
+    let started = Instant::now();
+    let mut deadline = started;
+    let mut worst_post_ms = 0.0_f64;
+    for i in 0..total {
+        deadline += period;
+        let dx = if i % 2 == 0 { amp } else { -amp };
+        trace::stamp(trace::Stage::BenchTick, i + 1, dx, 0, 0);
+        let post_started = Instant::now();
+        sink.apply_motion(dx, 0, i + 1)?;
+        worst_post_ms = worst_post_ms.max(latency::ms(post_started.elapsed()));
+
+        // Sleep to ~1 ms short of the deadline, then spin for precision.
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let remaining = deadline - now;
+            if remaining > std::time::Duration::from_millis(1) {
+                std::thread::sleep(remaining - std::time::Duration::from_millis(1));
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+    }
+    let elapsed = started.elapsed();
+    trace::set_active(false);
+
+    println!(
+        "done: elapsed_ms={:.1} worst_single_post_ms={:.3}",
+        latency::ms(elapsed),
+        worst_post_ms
+    );
+    println!();
+    let events = trace::snapshot_events();
+    trace_analyze::report_events(&events, 20.0, 20);
+    if dump {
+        if let Some(path) = trace::dump("cg-bench") {
+            println!("dump: {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_mac_cg_bench(_seconds: u32, _hz: u32, _amp: i32, _dump: bool) -> Result<()> {
+    bail!("mac-cg-bench is macOS-only")
 }
 
 fn run_win_raw_cadence(_seconds: u32, _mode: WinRawCadenceMode) -> Result<()> {
