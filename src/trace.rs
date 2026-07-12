@@ -544,6 +544,7 @@ pub struct TraceEvent {
 }
 
 /// Snapshot the live ring into decoded, time-ordered events (bench use).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn snapshot_events() -> Vec<TraceEvent> {
     let Some(ring) = RING.get() else {
         return Vec::new();

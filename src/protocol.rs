@@ -163,7 +163,7 @@ pub struct MotionDatagram {
 }
 
 impl MotionDatagram {
-    #[cfg_attr(not(any(test, windows)), allow(dead_code))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(seq: u64, dx: i32, dy: i32) -> Self {
         Self {
             seq,

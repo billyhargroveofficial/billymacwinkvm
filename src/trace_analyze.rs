@@ -521,6 +521,7 @@ pub fn run(files: Vec<PathBuf>, stall_ms: f64, top: usize) -> Result<()> {
 }
 
 /// In-process report used by mac-cg-bench: same tables, no file round-trip.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn report_events(events: &[TraceEvent], stall_ms: f64, top: usize) {
     let spans = active_spans(events);
     let analysis = stage_gap_analysis(events, &spans, stall_ms);
