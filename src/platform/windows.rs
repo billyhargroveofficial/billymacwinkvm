@@ -2488,17 +2488,26 @@ pub async fn run_port_doctor(peer: Option<String>) -> Result<()> {
                     *per_pid.entry(pid).or_default() += 1;
                 }
             }
+            let range_size = dynamic_numbers.get(1).copied().unwrap_or(16384).max(1);
             println!(
-                "[4] tcp sockets: total={total_rows}, local port in dynamic range={in_dynamic}"
+                "[4] tcp sockets: total={total_rows}, local port in dynamic range={in_dynamic} \
+                 (range holds {range_size} ports; TIME_WAIT rows can exceed that)"
             );
+            let names = tasklist_names_by_pid();
             let mut top: Vec<(String, u32)> = per_pid.into_iter().collect();
             top.sort_by(|a, b| b.1.cmp(&a.1));
             for (pid, count) in top.into_iter().take(5) {
-                println!("    pid {pid}: {count} dynamic-range sockets");
+                let name = names
+                    .get(&pid)
+                    .map(|name| format!(" ({name})"))
+                    .unwrap_or_default();
+                println!("    pid {pid}{name}: {count} dynamic-range sockets");
             }
-            if in_dynamic > 10_000 {
+            if in_dynamic as u64 * 100 / range_size as u64 >= 60 {
                 println!(
-                    ">>> dynamic range is close to exhaustion; the top pid above is the leak."
+                    ">>> dynamic range is (near) exhaustion; the top pid above is the socket \
+                     flood. Identify it, then restart or fix that process — this is what \
+                     produced the 10048 storms."
                 );
             }
         }
@@ -2589,6 +2598,25 @@ pub async fn run_port_doctor(peer: Option<String>) -> Result<()> {
     println!("* self-test clean but softkvm fails   -> per-app WFP/AV rule: add a Defender");
     println!("  exclusion for the kit folder (tradeoff: that folder stops being scanned)");
     Ok(())
+}
+
+/// Map pid -> image name via `tasklist /fo csv /nh` (fields stay parseable on
+/// localized Windows; only the labels we skip are translated).
+fn tasklist_names_by_pid() -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let Ok(output) = std::process::Command::new("tasklist")
+        .args(["/fo", "csv", "/nh"])
+        .output()
+    else {
+        return map;
+    };
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let fields: Vec<&str> = line.trim_matches('"').split("\",\"").collect();
+        if let [name, pid, ..] = fields.as_slice() {
+            map.insert((*pid).to_owned(), (*name).to_owned());
+        }
+    }
+    map
 }
 
 /// Run netsh, print raw output, and best-effort extract numbers per line
