@@ -86,6 +86,12 @@ Check the exact build:
 
 .\\softkvm.exe build-info
 
+v0019+: the host auto-connects (retries forever, reconnects on loss, tray
+tooltip shows the state), sits in the system tray (right-click -> Quit), and
+syncs the clipboard with the Mac both ways - plain text and images
+(screenshots). Toggles: SOFTKVM_CLIPBOARD=0 disables sync, SOFTKVM_TRAY=0
+hides the Mac menu-bar item. Both machines need v0019+ for clipboard.
+
 Current default host path uses buffered Raw Input and immediate UDP motion.
 Fallbacks:
 

@@ -1,4 +1,5 @@
 mod cli;
+mod clipboard;
 mod hid;
 mod latency;
 mod platform;
@@ -48,6 +49,35 @@ fn main() -> Result<()> {
     #[cfg(target_os = "macos")]
     platform::macos::prepare_low_latency_thread("main thread");
 
+    // The macOS menu-bar item must own the main thread (AppKit rule), so the
+    // client's async runtime moves to a background thread in tray mode.
+    #[cfg(target_os = "macos")]
+    if let Command::Client { listen, .. } = &cli.command
+        && platform::macos::tray_enabled()
+    {
+        let status_line = format!("softkvm client — {listen}");
+        std::thread::Builder::new()
+            .name("softkvm-client-main".to_owned())
+            .spawn(move || {
+                platform::macos::prepare_low_latency_thread("client runtime thread");
+                let result = match build_runtime() {
+                    Ok(runtime) => runtime.block_on(run(cli)),
+                    Err(err) => Err(err),
+                };
+                if let Err(err) = result {
+                    tracing::error!(?err, "softkvm client failed");
+                    std::process::exit(1);
+                }
+                std::process::exit(0);
+            })
+            .context("spawn client runtime thread")?;
+        platform::macos::run_menu_bar_tray(&status_line);
+    }
+
+    build_runtime()?.block_on(run(cli))
+}
+
+fn build_runtime() -> Result<tokio::runtime::Runtime> {
     let mut runtime = tokio::runtime::Builder::new_multi_thread();
     runtime.enable_all();
     runtime.worker_threads(2);
@@ -61,10 +91,7 @@ fn main() -> Result<()> {
         platform::macos::prepare_low_latency_thread("Tokio runtime worker");
     });
 
-    runtime
-        .build()
-        .context("build Tokio runtime")?
-        .block_on(run(cli))
+    runtime.build().context("build Tokio runtime")
 }
 
 async fn run(cli: Cli) -> Result<()> {
@@ -178,6 +205,11 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
     let motion_shared = Arc::new(MacMotionShared::default());
     let (motion_event_tx, mut motion_event_rx) = mpsc::unbounded_channel();
     start_mac_motion_tasks(udp_socket, sink, motion_shared.clone(), motion_event_tx).await?;
+    let (clipboard_tx, mut clipboard_rx) = mpsc::unbounded_channel::<protocol::ClipboardEvent>();
+    #[cfg(target_os = "macos")]
+    platform::macos::spawn_clipboard_watcher(clipboard_tx);
+    #[cfg(not(target_os = "macos"))]
+    drop(clipboard_tx);
     info!(%listen, "softkvm client listening");
     info!(%listen, "softkvm direct udp motion worker listening");
 
@@ -230,10 +262,31 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
                         };
                         ClientEvent::Motion(motion_event)
                     }
+                    clipboard_event = clipboard_rx.recv() => {
+                        let Some(clipboard_event) = clipboard_event else {
+                            continue;
+                        };
+                        ClientEvent::ClipboardOut(clipboard_event)
+                    }
                 }
             };
 
             let (frame, read_at) = match event {
+                ClientEvent::ClipboardOut(clipboard_event) => {
+                    if let Err(err) = writer
+                        .write_frame(Frame::new(
+                            client_session_id,
+                            client_seq,
+                            Message::Clipboard(clipboard_event),
+                        ))
+                        .await
+                    {
+                        warn!(?err, "failed to send clipboard to host");
+                        break;
+                    }
+                    client_seq += 1;
+                    continue;
+                }
                 ClientEvent::Motion(MacMotionEvent::ReleaseHost { entry_y_ratio }) => {
                     if !mac_right_edge_release_enabled() {
                         continue;
@@ -363,6 +416,13 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
                 Message::Heartbeat { monotonic_ms } => {
                     trace!(monotonic_ms, "heartbeat");
                 }
+                Message::Clipboard(event) => {
+                    info!(kind = event.label(), "applying clipboard from host");
+                    #[cfg(target_os = "macos")]
+                    platform::macos::apply_clipboard_event(&event);
+                    #[cfg(not(target_os = "macos"))]
+                    let _ = event;
+                }
             }
         }
 
@@ -385,6 +445,7 @@ async fn run_client(listen: String, sink: SinkKind) -> Result<()> {
 enum ClientEvent {
     Tcp(ClientReadEvent),
     Motion(MacMotionEvent),
+    ClipboardOut(protocol::ClipboardEvent),
 }
 
 enum MacMotionEvent {

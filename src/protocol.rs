@@ -37,6 +37,7 @@ pub enum Message {
     ClientControl(ClientControlEvent),
     Input(InputEvent),
     InputReset,
+    Clipboard(ClipboardEvent),
 }
 
 impl Message {
@@ -48,6 +49,25 @@ impl Message {
             Self::ClientControl(_) => "client_control",
             Self::Input(event) => event.label(),
             Self::InputReset => "input_reset",
+            Self::Clipboard(event) => event.label(),
+        }
+    }
+}
+
+/// Bidirectional clipboard sync payload. Images travel as PNG in base64 so
+/// the frame stays valid JSON; both sides convert to/from their native
+/// formats (CF_DIB/"PNG" on Windows, PNG/TIFF pasteboard types on macOS).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum ClipboardEvent {
+    Text(String),
+    ImagePng { base64: String },
+}
+
+impl ClipboardEvent {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Text(_) => "clipboard_text",
+            Self::ImagePng { .. } => "clipboard_image",
         }
     }
 }

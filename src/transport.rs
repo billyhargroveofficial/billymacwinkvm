@@ -9,7 +9,9 @@ use tokio::net::{TcpSocket, TcpStream, lookup_host};
 use tokio::time::sleep;
 use tracing::warn;
 
-const MAX_FRAME_BYTES: usize = 1024 * 1024;
+// Clipboard image frames (PNG in base64) can be large; motion never goes
+// through TCP frames on the hot path, so a big cap costs nothing there.
+const MAX_FRAME_BYTES: usize = 48 * 1024 * 1024;
 
 /// Local-port scan used when the OS ephemeral allocator is broken (outbound
 /// connect/bind failing with WSAEADDRINUSE 10048, typically because Hyper-V/

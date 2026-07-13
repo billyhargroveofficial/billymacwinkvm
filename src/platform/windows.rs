@@ -19,6 +19,7 @@ use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
 };
 use windows::Win32::Media::timeBeginPeriod;
+use windows::Win32::System::DataExchange::AddClipboardFormatListener;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, HIGH_PRIORITY_CLASS, SetPriorityClass, SetThreadPriority,
@@ -45,8 +46,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP, RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP,
     RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL, RegisterClassW, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     SetCursorPos, SetTimer, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY, WM_HOTKEY, WM_INPUT,
-    WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLIPBOARDUPDATE,
+    WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP,
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW,
 };
 use windows::core::w;
 
@@ -78,6 +80,11 @@ static DIRECT_MOTION_FAST: OnceLock<SharedUdpMotionWriter> = OnceLock::new();
 static REMOTE_ACTIVE_FAST: AtomicBool = AtomicBool::new(false);
 static LOCAL_MOUSE_CAPTURE_FAST: AtomicBool = AtomicBool::new(true);
 static RAW_CADENCE_STATE: OnceLock<Mutex<RawCadenceState>> = OnceLock::new();
+/// TCP control-plane state for the tray tooltip.
+static CONNECTION_UP: AtomicBool = AtomicBool::new(false);
+static HOST_PEER: OnceLock<String> = OnceLock::new();
+/// Wakes the clipboard worker after WM_CLIPBOARDUPDATE.
+static CLIPBOARD_SIGNAL: OnceLock<std::sync::mpsc::Sender<()>> = OnceLock::new();
 
 thread_local! {
     static RAW_INPUT_BUFFER: RefCell<Vec<RAWINPUT>> =
@@ -128,9 +135,7 @@ pub async fn run_host(
     crate::trace::init("win-host");
     crate::trace::start_freeze_detector();
 
-    let stream =
-        crate::transport::connect_tcp_with_retry(&peer, 40, Duration::from_millis(250)).await?;
-    stream.set_nodelay(true).context("set TCP_NODELAY")?;
+    // The UDP motion socket is connectionless and survives TCP reconnects.
     let motion_transport = MotionTransport::connect(&peer).await;
     let direct_motion = motion_transport.direct_writer();
     if let Some(writer) = direct_motion.clone() {
@@ -146,16 +151,63 @@ pub async fn run_host(
             local_mouse_capture,
         )))
         .map_err(|_| anyhow!("Windows host state was already initialized"))?;
+    let _ = HOST_PEER.set(peer.clone());
 
-    let (read_half, write_half) = stream.into_split();
-    tokio::spawn(writer_task(write_half, rx, motion_transport));
-    tokio::spawn(control_reader_task(read_half));
+    tokio::spawn(connection_supervisor(peer.clone(), rx, motion_transport));
 
-    info!(%peer, %layout, activate_on_start, entry_x_ratio, entry_y_ratio, local_mouse_capture, "starting Windows host capture");
+    info!(%peer, %layout, activate_on_start, entry_x_ratio, entry_y_ratio, local_mouse_capture, "starting Windows host capture (auto-connect)");
     tokio::task::spawn_blocking(run_message_loop)
         .await
         .context("join Windows host message loop")?
         .context("run Windows host message loop")
+}
+
+/// Keep the host connected forever: dial, run a session, release local
+/// controls on loss, drain stale commands, and redial with a short backoff.
+/// Capture, hooks, hotkeys, and the tray stay alive across reconnects.
+async fn connection_supervisor(
+    peer: String,
+    mut rx: mpsc::UnboundedReceiver<HostCommand>,
+    mut motion_transport: MotionTransport,
+) {
+    let mut logged_waiting = false;
+    loop {
+        let stream = match crate::transport::connect_tcp_with_retry(
+            &peer,
+            1,
+            Duration::from_millis(0),
+        )
+        .await
+        {
+            Ok(stream) => stream,
+            Err(err) => {
+                if !logged_waiting {
+                    info!(%peer, %err, "peer unreachable; auto-connect keeps retrying");
+                    logged_waiting = true;
+                }
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                continue;
+            }
+        };
+        logged_waiting = false;
+        if let Err(err) = stream.set_nodelay(true) {
+            warn!(?err, "failed to set TCP_NODELAY");
+        }
+        CONNECTION_UP.store(true, Ordering::Relaxed);
+        info!(%peer, "host connected");
+
+        let (read_half, write_half) = stream.into_split();
+        let reader = tokio::spawn(control_reader_task(read_half));
+        writer_session(write_half, &mut rx, &mut motion_transport).await;
+        reader.abort();
+
+        CONNECTION_UP.store(false, Ordering::Relaxed);
+        release_host_state_after_transport_loss("connection lost; reconnecting");
+        // Drop commands queued while the link was down so stale keystrokes
+        // and motion do not replay into the next session.
+        while rx.try_recv().is_ok() {}
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+    }
 }
 
 pub fn run_raw_cadence(
@@ -804,10 +856,12 @@ fn accumulate_i32(cell: &AtomicI32, delta: i32) {
     });
 }
 
-async fn writer_task(
+/// One TCP session: hello, then pump host commands until the link fails.
+/// Returns instead of ending the task so the supervisor can reconnect.
+async fn writer_session(
     stream: OwnedWriteHalf,
-    mut rx: mpsc::UnboundedReceiver<HostCommand>,
-    mut motion_transport: MotionTransport,
+    rx: &mut mpsc::UnboundedReceiver<HostCommand>,
+    motion_transport: &mut MotionTransport,
 ) {
     let mut writer = FrameWriter::new(stream);
     let session_id = Uuid::new_v4();
@@ -842,9 +896,9 @@ async fn writer_task(
         if let Some(command) = deferred_command.take() {
             if !handle_host_command(
                 command,
-                &mut rx,
+                rx,
                 &mut writer,
-                &mut motion_transport,
+                motion_transport,
                 session_id,
                 &mut seq,
                 &mut pending_dx,
@@ -868,17 +922,15 @@ async fn writer_task(
             }
             command = rx.recv() => {
                 let Some(command) = command else {
-                    if !flush_pending_motion(&mut writer, session_id, &mut seq, &mut pending_dx, &mut pending_dy).await {
-                        break;
-                    }
+                    let _ = flush_pending_motion(&mut writer, session_id, &mut seq, &mut pending_dx, &mut pending_dy).await;
                     break;
                 };
 
                 if !handle_host_command(
                     command,
-                    &mut rx,
+                    rx,
                     &mut writer,
-                    &mut motion_transport,
+                    motion_transport,
                     session_id,
                     &mut seq,
                     &mut pending_dx,
@@ -1003,6 +1055,19 @@ async fn handle_host_command(
             motion_transport.confirm();
             true
         }
+        HostCommand::Clipboard(event) => {
+            if !flush_pending_motion(writer, session_id, seq, pending_dx, pending_dy).await {
+                return false;
+            }
+            write_host_message(
+                writer,
+                session_id,
+                seq,
+                Message::Clipboard(event),
+                "host writer disconnected",
+            )
+            .await
+        }
         other => {
             if !flush_pending_motion(writer, session_id, seq, pending_dx, pending_dy).await {
                 return false;
@@ -1111,6 +1176,7 @@ fn message_from_host_command(command: HostCommand) -> Message {
         }),
         HostCommand::Input(event) | HostCommand::InputImmediate(event) => Message::Input(event),
         HostCommand::Reset => Message::InputReset,
+        HostCommand::Clipboard(event) => Message::Clipboard(event),
         HostCommand::UdpMotionReady => unreachable!("handled before serialization"),
     }
 }
@@ -1133,6 +1199,11 @@ async fn control_reader_task(stream: OwnedReadHalf) {
             }
         };
 
+        if let Message::Clipboard(event) = frame.message {
+            info!(kind = event.label(), "applying clipboard from client");
+            tokio::task::spawn_blocking(move || apply_clipboard_event(&event));
+            continue;
+        }
         if let Message::ClientControl(control) = frame.message {
             match control {
                 ClientControlEvent::ReleaseHost {
@@ -1184,6 +1255,19 @@ fn run_message_loop() -> Result<()> {
         return Err(err);
     }
 
+    let tray = tray_add(hwnd);
+    if crate::clipboard::enabled() {
+        if let Err(err) = unsafe { AddClipboardFormatListener(hwnd) } {
+            warn!(?err, "clipboard listener registration failed");
+        } else {
+            let _ = CLIPBOARD_SIGNAL.set(spawn_clipboard_worker());
+            info!("clipboard sync enabled");
+        }
+    }
+    unsafe {
+        let _ = SetTimer(Some(hwnd), TRAY_REFRESH_TIMER_ID, 1000, None);
+    }
+
     info!("Windows Raw Input host is ready; Ctrl+Alt+\\ toggles remote control");
     if let Ok(mut state) = lock_state() {
         if let Some((entry_x_ratio, entry_y_ratio)) = state.activate_on_start.take()
@@ -1204,6 +1288,7 @@ fn run_message_loop() -> Result<()> {
         if result.0 == -1 {
             unsafe {
                 cleanup_host_state();
+                tray_remove(&tray);
                 unregister_hotkeys(hwnd);
                 let _ = DestroyWindow(hwnd);
             }
@@ -1221,6 +1306,7 @@ fn run_message_loop() -> Result<()> {
 
     unsafe {
         cleanup_host_state();
+        tray_remove(&tray);
         unregister_hotkeys(hwnd);
         let _ = DestroyWindow(hwnd);
     }
@@ -1342,6 +1428,25 @@ unsafe extern "system" fn wnd_proc(
                 warn!(?err, "raw input failed");
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_CLIPBOARDUPDATE => {
+            // Never read the clipboard on the input thread: just poke the
+            // worker, which does the OpenClipboard/convert/send dance.
+            if let Some(signal) = CLIPBOARD_SIGNAL.get() {
+                let _ = signal.send(());
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == TRAY_REFRESH_TIMER_ID => {
+            tray_refresh_tooltip(hwnd);
+            LRESULT(0)
+        }
+        WM_APP_TRAY_CALLBACK => {
+            let event = (lparam.0 & 0xffff) as u32;
+            if matches!(event, WM_RBUTTONUP | WM_LBUTTONUP | WM_CONTEXTMENU) {
+                tray_show_menu(hwnd);
+            }
+            LRESULT(0)
         }
         WM_DESTROY => {
             unsafe {
@@ -1928,6 +2033,7 @@ enum HostCommand {
     InputImmediate(InputEvent),
     UdpMotionReady,
     Reset,
+    Clipboard(crate::protocol::ClipboardEvent),
 }
 
 struct HostState {
@@ -2648,4 +2754,437 @@ fn print_netsh(args: &[&str]) -> (Vec<u32>, Vec<(u32, u32)>) {
         }
     }
     (singles, pairs)
+}
+
+// ---------------------------------------------------------------------------
+// System tray
+// ---------------------------------------------------------------------------
+
+const WM_APP_TRAY_CALLBACK: u32 = WM_APP + 1;
+const TRAY_REFRESH_TIMER_ID: usize = 5;
+const TRAY_ICON_ID: u32 = 1;
+const TRAY_MENU_QUIT_ID: usize = 100;
+
+fn tray_tooltip_text() -> String {
+    let peer = HOST_PEER.get().map(String::as_str).unwrap_or("?");
+    if CONNECTION_UP.load(Ordering::Relaxed) {
+        format!("softkvm — connected to {peer}")
+    } else {
+        format!("softkvm — connecting to {peer}…")
+    }
+}
+
+fn write_tooltip(target: &mut [u16; 128], text: &str) {
+    let encoded: Vec<u16> = text.encode_utf16().take(127).collect();
+    target[..encoded.len()].copy_from_slice(&encoded);
+    target[encoded.len()] = 0;
+}
+
+fn tray_add(hwnd: HWND) -> windows::Win32::UI::Shell::NOTIFYICONDATAW {
+    use windows::Win32::UI::Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, Shell_NotifyIconW};
+    use windows::Win32::UI::WindowsAndMessaging::{IDI_APPLICATION, LoadIconW};
+
+    let mut data = windows::Win32::UI::Shell::NOTIFYICONDATAW {
+        cbSize: size_of::<windows::Win32::UI::Shell::NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ICON_ID,
+        uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+        uCallbackMessage: WM_APP_TRAY_CALLBACK,
+        hIcon: unsafe { LoadIconW(None, IDI_APPLICATION).unwrap_or_default() },
+        ..Default::default()
+    };
+    write_tooltip(&mut data.szTip, &tray_tooltip_text());
+    let added = unsafe { Shell_NotifyIconW(NIM_ADD, &data) };
+    if added.as_bool() {
+        info!("tray icon added");
+    } else {
+        warn!("tray icon could not be added");
+    }
+    data
+}
+
+fn tray_refresh_tooltip(hwnd: HWND) {
+    use windows::Win32::UI::Shell::{NIF_TIP, NIM_MODIFY, Shell_NotifyIconW};
+
+    let mut data = windows::Win32::UI::Shell::NOTIFYICONDATAW {
+        cbSize: size_of::<windows::Win32::UI::Shell::NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ICON_ID,
+        uFlags: NIF_TIP,
+        ..Default::default()
+    };
+    write_tooltip(&mut data.szTip, &tray_tooltip_text());
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
+    }
+}
+
+fn tray_remove(data: &windows::Win32::UI::Shell::NOTIFYICONDATAW) {
+    use windows::Win32::UI::Shell::{NIM_DELETE, Shell_NotifyIconW};
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_DELETE, data);
+    }
+}
+
+fn tray_show_menu(hwnd: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, DestroyMenu, MF_GRAYED, MF_SEPARATOR, MF_STRING,
+        SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+    };
+    use windows::core::PCWSTR;
+
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else {
+            return;
+        };
+        let status: Vec<u16> = tray_tooltip_text().encode_utf16().chain([0]).collect();
+        let quit: Vec<u16> = "Quit softkvm".encode_utf16().chain([0]).collect();
+        let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(status.as_ptr()));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(menu, MF_STRING, TRAY_MENU_QUIT_ID, PCWSTR(quit.as_ptr()));
+
+        let mut point = POINT::default();
+        let _ = GetCursorPos(&mut point);
+        // Required for the menu to dismiss correctly from a tray context.
+        let _ = SetForegroundWindow(hwnd);
+        let choice = TrackPopupMenu(
+            menu,
+            TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+            point.x,
+            point.y,
+            None,
+            hwnd,
+            None,
+        );
+        let _ = DestroyMenu(menu);
+        if choice.0 as usize == TRAY_MENU_QUIT_ID {
+            info!("quit requested from tray");
+            PostQuitMessage(0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Clipboard (Win32)
+// ---------------------------------------------------------------------------
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+
+use crate::protocol::ClipboardEvent;
+
+/// Reads happen on a dedicated worker so clipboard conversion never runs on
+/// the Raw Input thread; WM_CLIPBOARDUPDATE only pokes this channel.
+fn spawn_clipboard_worker() -> std::sync::mpsc::Sender<()> {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    thread::Builder::new()
+        .name("softkvm-clipboard".to_owned())
+        .spawn(move || {
+            while rx.recv().is_ok() {
+                // Apps announce several formats in a burst; let it settle,
+                // then collapse the burst into one read.
+                thread::sleep(Duration::from_millis(80));
+                while rx.try_recv().is_ok() {}
+
+                let Some(event) = read_clipboard_event() else {
+                    continue;
+                };
+                if !crate::clipboard::within_limits(&event) {
+                    info!(kind = event.label(), "clipboard content too large to sync");
+                    continue;
+                }
+                if !crate::clipboard::should_send(&event) {
+                    continue;
+                }
+                info!(kind = event.label(), "sending local clipboard to peer");
+                match lock_state() {
+                    Ok(state) => {
+                        if let Err(err) = state.send(HostCommand::Clipboard(event)) {
+                            warn!(?err, "failed to queue clipboard for peer");
+                        }
+                    }
+                    Err(err) => warn!(?err, "failed to lock host state for clipboard"),
+                }
+            }
+        })
+        .expect("spawn clipboard worker");
+    tx
+}
+
+/// RAII OpenClipboard with retries: the clipboard is a global lock and other
+/// apps hold it briefly right after a copy.
+struct ClipboardGuard;
+
+impl ClipboardGuard {
+    fn open() -> Option<Self> {
+        use windows::Win32::System::DataExchange::OpenClipboard;
+        for _ in 0..10 {
+            if unsafe { OpenClipboard(None) }.is_ok() {
+                return Some(Self);
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        warn!("could not open Windows clipboard");
+        None
+    }
+}
+
+impl Drop for ClipboardGuard {
+    fn drop(&mut self) {
+        use windows::Win32::System::DataExchange::CloseClipboard;
+        unsafe {
+            let _ = CloseClipboard();
+        }
+    }
+}
+
+fn clipboard_png_format() -> u32 {
+    use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
+    static FORMAT: OnceLock<u32> = OnceLock::new();
+    *FORMAT.get_or_init(|| unsafe { RegisterClipboardFormatW(w!("PNG")) })
+}
+
+fn clipboard_bytes(format: u32) -> Option<Vec<u8>> {
+    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::DataExchange::GetClipboardData;
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+
+    let handle = unsafe { GetClipboardData(format) }.ok()?;
+    if handle.is_invalid() {
+        return None;
+    }
+    let hglobal = HGLOBAL(handle.0);
+    let pointer = unsafe { GlobalLock(hglobal) };
+    if pointer.is_null() {
+        return None;
+    }
+    let size = unsafe { GlobalSize(hglobal) };
+    let bytes = unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), size) }.to_vec();
+    unsafe {
+        let _ = GlobalUnlock(hglobal);
+    }
+    Some(bytes)
+}
+
+fn read_clipboard_event() -> Option<ClipboardEvent> {
+    use windows::Win32::System::Ole::{CF_DIB, CF_UNICODETEXT};
+
+    let _guard = ClipboardGuard::open()?;
+
+    if let Some(png) = clipboard_bytes(clipboard_png_format()) {
+        return Some(ClipboardEvent::ImagePng {
+            base64: BASE64.encode(png),
+        });
+    }
+    if let Some(dib) = clipboard_bytes(u32::from(CF_DIB.0))
+        && let Some(png) = dib_to_png(&dib)
+    {
+        return Some(ClipboardEvent::ImagePng {
+            base64: BASE64.encode(png),
+        });
+    }
+    if let Some(raw) = clipboard_bytes(u32::from(CF_UNICODETEXT.0)) {
+        let units: Vec<u16> = raw
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .take_while(|&unit| unit != 0)
+            .collect();
+        return Some(ClipboardEvent::Text(String::from_utf16_lossy(&units)));
+    }
+    None
+}
+
+fn set_clipboard_bytes(format: u32, bytes: &[u8]) -> bool {
+    use windows::Win32::Foundation::GlobalFree;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::DataExchange::SetClipboardData;
+    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+
+    unsafe {
+        let Ok(hglobal) = GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1)) else {
+            return false;
+        };
+        let pointer = GlobalLock(hglobal);
+        if pointer.is_null() {
+            let _ = GlobalFree(Some(hglobal));
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer.cast::<u8>(), bytes.len());
+        let _ = GlobalUnlock(hglobal);
+        // On success the system owns the allocation.
+        if SetClipboardData(format, Some(HANDLE(hglobal.0))).is_ok() {
+            true
+        } else {
+            let _ = GlobalFree(Some(hglobal));
+            false
+        }
+    }
+}
+
+fn apply_clipboard_event(event: &ClipboardEvent) {
+    use windows::Win32::System::DataExchange::EmptyClipboard;
+    use windows::Win32::System::Ole::{CF_DIB, CF_UNICODETEXT};
+
+    crate::clipboard::note_applied(event);
+    let Some(_guard) = ClipboardGuard::open() else {
+        return;
+    };
+    unsafe {
+        let _ = EmptyClipboard();
+    }
+    let ok = match event {
+        ClipboardEvent::Text(text) => {
+            let raw: Vec<u8> = text
+                .encode_utf16()
+                .chain([0])
+                .flat_map(u16::to_le_bytes)
+                .collect();
+            set_clipboard_bytes(u32::from(CF_UNICODETEXT.0), &raw)
+        }
+        ClipboardEvent::ImagePng { base64 } => {
+            let Ok(png) = BASE64.decode(base64) else {
+                warn!("peer clipboard image was not valid base64");
+                return;
+            };
+            let mut ok = set_clipboard_bytes(clipboard_png_format(), &png);
+            if let Some(dib) = png_to_dib(&png) {
+                ok |= set_clipboard_bytes(u32::from(CF_DIB.0), &dib);
+            }
+            ok
+        }
+    };
+    if !ok {
+        warn!(kind = event.label(), "failed to set Windows clipboard");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DIB <-> PNG
+// ---------------------------------------------------------------------------
+
+/// Convert a CF_DIB payload (BITMAPINFOHEADER + pixels, no file header) to
+/// PNG. Supports the formats real apps produce: 24/32 bpp BI_RGB and 32 bpp
+/// BI_BITFIELDS with the standard BGRA masks.
+fn dib_to_png(dib: &[u8]) -> Option<Vec<u8>> {
+    if dib.len() < 40 {
+        return None;
+    }
+    let header_size = u32::from_le_bytes(dib[0..4].try_into().ok()?) as usize;
+    let width = i32::from_le_bytes(dib[4..8].try_into().ok()?);
+    let height_raw = i32::from_le_bytes(dib[8..12].try_into().ok()?);
+    let bpp = u16::from_le_bytes(dib[14..16].try_into().ok()?);
+    let compression = u32::from_le_bytes(dib[16..20].try_into().ok()?);
+    let colors_used = u32::from_le_bytes(dib[32..36].try_into().ok()?) as usize;
+
+    if header_size < 40 || width <= 0 || height_raw == 0 || !(bpp == 24 || bpp == 32) {
+        return None;
+    }
+    let mut pixel_offset = header_size + colors_used * 4;
+    match compression {
+        0 => {}
+        3 => {
+            // Accept only the standard little-endian BGRA layout.
+            let masks_at = if header_size >= 52 { 40 } else { header_size };
+            if dib.len() < masks_at + 12 {
+                return None;
+            }
+            let read_mask = |at: usize| -> Option<u32> {
+                Some(u32::from_le_bytes(dib.get(at..at + 4)?.try_into().ok()?))
+            };
+            let red = read_mask(masks_at)?;
+            let green = read_mask(masks_at + 4)?;
+            let blue = read_mask(masks_at + 8)?;
+            if (red, green, blue) != (0x00ff_0000, 0x0000_ff00, 0x0000_00ff) {
+                return None;
+            }
+            if header_size == 40 {
+                pixel_offset += 12;
+            }
+        }
+        _ => return None,
+    }
+
+    let top_down = height_raw < 0;
+    let width = width as usize;
+    let height = height_raw.unsigned_abs() as usize;
+    let bytes_per_pixel = usize::from(bpp / 8);
+    let stride = (width * bytes_per_pixel).div_ceil(4) * 4;
+    if dib.len() < pixel_offset + stride * height {
+        return None;
+    }
+
+    let mut rgba = vec![0_u8; width * height * 4];
+    for y in 0..height {
+        let source_y = if top_down { y } else { height - 1 - y };
+        let row = &dib[pixel_offset + source_y * stride..];
+        for x in 0..width {
+            let source = &row[x * bytes_per_pixel..];
+            let target = &mut rgba[(y * width + x) * 4..(y * width + x) * 4 + 4];
+            target[0] = source[2];
+            target[1] = source[1];
+            target[2] = source[0];
+            target[3] = if bytes_per_pixel == 4 {
+                // Many producers leave alpha zeroed; treat all-zero as opaque
+                // later only if needed — here keep the raw value unless zero.
+                if source[3] == 0 { 255 } else { source[3] }
+            } else {
+                255
+            };
+        }
+    }
+
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, width as u32, height as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().ok()?;
+        writer.write_image_data(&rgba).ok()?;
+    }
+    Some(out)
+}
+
+/// Convert PNG bytes to a bottom-up 32 bpp BI_RGB CF_DIB payload.
+fn png_to_dib(png_bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().ok()?;
+    let mut buffer = vec![0_u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buffer).ok()?;
+    let width = info.width as usize;
+    let height = info.height as usize;
+    let rgba: Vec<u8> = match info.color_type {
+        png::ColorType::Rgba => buffer[..width * height * 4].to_vec(),
+        png::ColorType::Rgb => buffer[..width * height * 3]
+            .chunks_exact(3)
+            .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 255])
+            .collect(),
+        png::ColorType::Grayscale => buffer[..width * height]
+            .iter()
+            .flat_map(|&value| [value, value, value, 255])
+            .collect(),
+        png::ColorType::GrayscaleAlpha => buffer[..width * height * 2]
+            .chunks_exact(2)
+            .flat_map(|pixel| [pixel[0], pixel[0], pixel[0], pixel[1]])
+            .collect(),
+        png::ColorType::Indexed => return None,
+    };
+
+    let mut dib = Vec::with_capacity(40 + width * height * 4);
+    dib.extend_from_slice(&40_u32.to_le_bytes());
+    dib.extend_from_slice(&(width as i32).to_le_bytes());
+    dib.extend_from_slice(&(height as i32).to_le_bytes()); // positive: bottom-up
+    dib.extend_from_slice(&1_u16.to_le_bytes());
+    dib.extend_from_slice(&32_u16.to_le_bytes());
+    dib.extend_from_slice(&0_u32.to_le_bytes()); // BI_RGB
+    dib.extend_from_slice(&((width * height * 4) as u32).to_le_bytes());
+    dib.extend_from_slice(&[0_u8; 16]); // ppm x/y, clr used/important
+
+    for y in (0..height).rev() {
+        let row = &rgba[y * width * 4..(y + 1) * width * 4];
+        for pixel in row.chunks_exact(4) {
+            dib.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+        }
+    }
+    Some(dib)
 }
