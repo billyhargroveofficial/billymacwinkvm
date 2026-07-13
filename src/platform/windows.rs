@@ -561,7 +561,7 @@ impl MotionTransport {
             return Self::Tcp;
         }
 
-        match StdUdpSocket::bind("0.0.0.0:0") {
+        match crate::transport::bind_udp_with_fallback() {
             Ok(socket) => match socket.connect(peer) {
                 Ok(()) => {
                     info!(%peer, "using udp/binary motion transport");
@@ -2379,4 +2379,245 @@ fn usb_usage_for_vkey(vkey: u16) -> Option<u16> {
         v if v == VK_OEM_102.0 => Some(0x64),
         _ => None,
     }
+}
+
+/// Built-in triage for outbound WSAEADDRINUSE 10048: no PowerShell needed, so
+/// execution policy and localization cannot get in the way. Everything here
+/// is read-only except the throwaway bind/connect probes.
+pub async fn run_port_doctor(peer: Option<String>) -> Result<()> {
+    println!("== softkvm win-port-doctor ==");
+    println!("Outbound connect failing with 10048/AddrInUse means the LOCAL machine could");
+    println!("not allocate an ephemeral source port. This is not the Mac refusing (that");
+    println!("would be 10061/10060).");
+    println!();
+
+    // 1. Ephemeral allocation self-test. Sockets are held during the loop so
+    //    each bind must produce a fresh port, then all are released.
+    let mut tcp_failures = 0_u32;
+    let mut tcp_holds = Vec::new();
+    for _ in 0..100 {
+        match std::net::TcpListener::bind(("0.0.0.0", 0)) {
+            Ok(listener) => tcp_holds.push(listener),
+            Err(_) => tcp_failures += 1,
+        }
+    }
+    drop(tcp_holds);
+    let mut udp_failures = 0_u32;
+    let mut udp_holds = Vec::new();
+    for _ in 0..100 {
+        match StdUdpSocket::bind("0.0.0.0:0") {
+            Ok(socket) => udp_holds.push(socket),
+            Err(_) => udp_failures += 1,
+        }
+    }
+    drop(udp_holds);
+    println!(
+        "[1] ephemeral self-test: tcp_failures={tcp_failures}/100 udp_failures={udp_failures}/100"
+    );
+
+    // 2. Explicit fallback range availability (what the host now uses on 10048).
+    let mut scan_ok = 0_u32;
+    for index in 0..crate::transport::EXPLICIT_BIND_PORT_ATTEMPTS {
+        let port = crate::transport::explicit_bind_candidate_port(index);
+        if let Ok(listener) = std::net::TcpListener::bind(("0.0.0.0", port)) {
+            drop(listener);
+            scan_ok += 1;
+        }
+    }
+    println!(
+        "[2] explicit fallback range (21309-27772): {scan_ok}/{} candidates bindable",
+        crate::transport::EXPLICIT_BIND_PORT_ATTEMPTS
+    );
+    println!();
+
+    // 3. OS configuration as netsh reports it (raw, survives localization).
+    // dynamicport prints one number per line (start, then count); excluded
+    // ranges print two numbers per line (start, end).
+    let (dynamic_numbers, _) = print_netsh(&["int", "ipv4", "show", "dynamicport", "tcp"]);
+    let (_, excluded) = print_netsh(&["int", "ipv4", "show", "excludedportrange", "protocol=tcp"]);
+    if let (Some(&start), Some(&count)) = (dynamic_numbers.first(), dynamic_numbers.get(1)) {
+        let dyn_lo = start;
+        let dyn_hi = start.saturating_add(count.saturating_sub(1));
+        let covered: u32 = excluded
+            .iter()
+            .map(|&(range_start, range_end_or_count)| {
+                // excludedportrange rows are (start, end); dynamicport gave (start, count).
+                let range_end = range_end_or_count.max(range_start);
+                let lo = range_start.max(dyn_lo);
+                let hi = range_end.min(dyn_hi);
+                hi.saturating_sub(lo).saturating_add(u32::from(hi >= lo))
+            })
+            .sum();
+        let total = count.max(1);
+        println!(
+            "[3] dynamic range {dyn_lo}-{dyn_hi} ({total} ports); excluded ranges cover ~{covered} of them ({}%)",
+            covered.saturating_mul(100) / total
+        );
+        if covered.saturating_mul(100) / total >= 60 {
+            println!(">>> exclusion ranges (Hyper-V/WSL/WinNAT) are eating the dynamic range.");
+        }
+    }
+    println!();
+
+    // 4. Dynamic-range occupancy from netstat (state names are localized, so
+    //    count local ports and owning PIDs instead of parsing state words).
+    match std::process::Command::new("netstat")
+        .args(["-ano", "-p", "tcp"])
+        .output()
+    {
+        Ok(output) => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let mut in_dynamic = 0_u32;
+            let mut total_rows = 0_u32;
+            let mut per_pid: HashMap<String, u32> = HashMap::new();
+            let dyn_lo = dynamic_numbers.first().copied().unwrap_or(49152);
+            for line in text.lines() {
+                let tokens: Vec<&str> = line.split_whitespace().collect();
+                if tokens.len() < 4 || !tokens[0].eq_ignore_ascii_case("tcp") {
+                    continue;
+                }
+                total_rows += 1;
+                if let Some(port) = tokens[1]
+                    .rsplit(':')
+                    .next()
+                    .and_then(|p| p.parse::<u32>().ok())
+                    && port >= dyn_lo
+                {
+                    in_dynamic += 1;
+                    let pid = tokens.last().copied().unwrap_or("?").to_owned();
+                    *per_pid.entry(pid).or_default() += 1;
+                }
+            }
+            println!(
+                "[4] tcp sockets: total={total_rows}, local port in dynamic range={in_dynamic}"
+            );
+            let mut top: Vec<(String, u32)> = per_pid.into_iter().collect();
+            top.sort_by(|a, b| b.1.cmp(&a.1));
+            for (pid, count) in top.into_iter().take(5) {
+                println!("    pid {pid}: {count} dynamic-range sockets");
+            }
+            if in_dynamic > 10_000 {
+                println!(
+                    ">>> dynamic range is close to exhaustion; the top pid above is the leak."
+                );
+            }
+        }
+        Err(err) => println!("[4] netstat unavailable: {err}"),
+    }
+    println!();
+
+    // 5. Duplicate softkvm processes.
+    match std::process::Command::new("tasklist").output() {
+        Ok(output) => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let ours: Vec<&str> = text
+                .lines()
+                .filter(|line| line.to_ascii_lowercase().contains("softkvm"))
+                .collect();
+            println!("[5] softkvm processes: {}", ours.len());
+            for line in &ours {
+                println!("    {line}");
+            }
+            if ours.len() > 1 {
+                println!(">>> more than one instance; stop the extras before testing.");
+            }
+        }
+        Err(err) => println!("[5] tasklist unavailable: {err}"),
+    }
+    println!();
+
+    // 6. Real outbound probes, both paths the host uses.
+    if let Some(peer) = peer {
+        print!("[6] direct connect {peer}: ");
+        match tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::net::TcpStream::connect(peer.as_str()),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => {
+                println!(
+                    "OK (local {})",
+                    stream
+                        .local_addr()
+                        .map(|a| a.to_string())
+                        .unwrap_or_default()
+                );
+            }
+            Ok(Err(err)) => println!(
+                "FAILED: {err} (kind={:?}, os={:?})",
+                err.kind(),
+                err.raw_os_error()
+            ),
+            Err(_) => println!("TIMEOUT after 3s"),
+        }
+        print!("    explicit-bind connect {peer}: ");
+        match tokio::time::timeout(
+            Duration::from_secs(3),
+            crate::transport::connect_via_explicit_local_bind(&peer),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => {
+                println!(
+                    "OK (local {}) — the host works on this machine via the built-in fallback",
+                    stream
+                        .local_addr()
+                        .map(|a| a.to_string())
+                        .unwrap_or_default()
+                );
+            }
+            Ok(Err(err)) => println!(
+                "FAILED: {err} (kind={:?}, os={:?})",
+                err.kind(),
+                err.raw_os_error()
+            ),
+            Err(_) => println!("TIMEOUT after 3s"),
+        }
+        println!();
+    }
+
+    println!("== fixes by finding ==");
+    println!("* exclusions cover the dynamic range  -> reboot often reshuffles WinNAT; or");
+    println!("  `net stop winnat && net start winnat` (admin); or delete stale ranges:");
+    println!(
+        "  `netsh int ipv4 delete excludedportrange protocol=tcp startport=N numberofports=M`"
+    );
+    println!("* dynamic range tiny/misconfigured    -> `netsh int ipv4 set dynamicport tcp");
+    println!("  start=49152 num=16384` (admin), then reboot");
+    println!("* one pid hoards dynamic-range ports  -> that process leaks sockets; restart it");
+    println!("* self-test clean but softkvm fails   -> per-app WFP/AV rule: add a Defender");
+    println!("  exclusion for the kit folder (tradeoff: that folder stops being scanned)");
+    Ok(())
+}
+
+/// Run netsh, print raw output, and best-effort extract numbers per line
+/// (localization-proof: labels change, numbers do not). Returns the flat
+/// sequence of standalone numbers (for dynamicport: start, then count) and
+/// the (first, second) pairs from two-number lines (excludedportrange rows).
+fn print_netsh(args: &[&str]) -> (Vec<u32>, Vec<(u32, u32)>) {
+    println!("--- netsh {} ---", args.join(" "));
+    let output = match std::process::Command::new("netsh").args(args).output() {
+        Ok(output) => output,
+        Err(err) => {
+            println!("netsh unavailable: {err}");
+            return (Vec::new(), Vec::new());
+        }
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut singles = Vec::new();
+    let mut pairs = Vec::new();
+    for line in text.lines() {
+        println!("{line}");
+        let numbers: Vec<u32> = line
+            .split_whitespace()
+            .filter_map(|token| token.parse::<u32>().ok())
+            .collect();
+        match numbers.as_slice() {
+            [single] => singles.push(*single),
+            [first, second] if *first >= 1024 => pairs.push((*first, *second)),
+            _ => {}
+        }
+    }
+    (singles, pairs)
 }

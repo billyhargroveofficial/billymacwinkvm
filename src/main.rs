@@ -16,6 +16,7 @@ use protocol::{
     Modifier, MotionDatagram, MouseButton, ProtocolHello,
 };
 use std::collections::HashSet;
+#[cfg(target_os = "macos")]
 use std::net::UdpSocket as StdUdpSocket;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
@@ -100,6 +101,7 @@ async fn run(cli: Cli) -> Result<()> {
             seconds,
             dx,
         } => run_motion_bench(peer, transport, timing, hz, seconds, dx).await,
+        Command::WinPortDoctor { peer } => run_win_port_doctor(peer).await,
         Command::WinRawCadence { seconds, mode } => run_win_raw_cadence(seconds, mode),
         Command::Host {
             peer,
@@ -1469,7 +1471,7 @@ async fn run_motion_bench(
     let stream = transport::connect_tcp_with_retry(&peer, 8, Duration::from_millis(250)).await?;
     stream.set_nodelay(true).context("set TCP_NODELAY")?;
     let udp = if matches!(bench_transport, BenchTransport::Udp) {
-        let socket = StdUdpSocket::bind("0.0.0.0:0").context("bind udp bench")?;
+        let socket = transport::bind_udp_with_fallback().context("bind udp bench")?;
         socket
             .connect(&peer)
             .with_context(|| format!("connect udp bench {peer}"))?;
@@ -1718,6 +1720,18 @@ fn run_mac_cg_bench(seconds: u32, hz: u32, amp: i32, dump: bool) -> Result<()> {
 #[cfg(not(target_os = "macos"))]
 fn run_mac_cg_bench(_seconds: u32, _hz: u32, _amp: i32, _dump: bool) -> Result<()> {
     bail!("mac-cg-bench is macOS-only")
+}
+
+async fn run_win_port_doctor(_peer: Option<String>) -> Result<()> {
+    #[cfg(windows)]
+    {
+        platform::windows::run_port_doctor(_peer).await
+    }
+
+    #[cfg(not(windows))]
+    {
+        bail!("win-port-doctor is Windows-only; run it from the Windows test kit")
+    }
 }
 
 fn run_win_raw_cadence(_seconds: u32, _mode: WinRawCadenceMode) -> Result<()> {

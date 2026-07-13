@@ -96,13 +96,31 @@ and prints one of:
 
 ## The separate Windows 10048 startup failure
 
-`softkvm probe` failing with `os error 10048 (AddrInUse)` on an **outbound**
-connect is a local ephemeral-port allocation failure, not the Mac port being
-busy (that would be 10061/10060) and not related to the 0.5 s freezes.
-Run `scripts/diagnose-addrinuse.ps1` (checks duplicate processes, TIME_WAIT
-floods, `netsh dynamicport`, Hyper-V/WSL `excludedportrange`, a 100-socket
-allocation self-test, Defender detections, and optional WFP state). The
-in-app retry loop now logs a targeted hint on the first AddrInUse.
+`softkvm probe`/`host` failing with `os error 10048 (AddrInUse)` on an
+**outbound** connect is a local ephemeral-port allocation failure, not the Mac
+port being busy (that would be 10061/10060) and not related to the 0.5 s
+freezes.
+
+Since v0017 the app **works around it automatically**: on AddrInUse it binds
+an explicit local port from 21309–27772 (below the possibly-broken dynamic
+range, bypassing the allocator) and connects; the log then says
+`connected via explicit local bind`. The UDP motion socket uses the same
+fallback, so a traced session runs even on a broken machine.
+
+To find and fix the OS-level cause, run the built-in doctor — plain exe, no
+PowerShell execution policy involved:
+
+```powershell
+.\softkvm.exe win-port-doctor --peer 192.168.1.11:49321
+```
+
+It self-tests ephemeral allocation (100 TCP + 100 UDP binds), checks the
+fallback range, prints `netsh dynamicport`/`excludedportrange` with automatic
+overlap math (Hyper-V/WSL/WinNAT reservations are the usual culprit after a
+reboot), counts dynamic-range sockets per PID (TIME_WAIT floods/leaks), lists
+duplicate softkvm processes, probes the peer via both connect paths, and
+prints the fix for each finding. `scripts/diagnose-addrinuse.ps1` remains as
+the PowerShell variant with Defender history and WFP state.
 
 ## References
 

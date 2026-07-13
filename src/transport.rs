@@ -1,14 +1,94 @@
 use crate::protocol::Frame;
 use std::io;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream, lookup_host};
 use tokio::time::sleep;
 use tracing::warn;
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Local-port scan used when the OS ephemeral allocator is broken (outbound
+/// connect/bind failing with WSAEADDRINUSE 10048, typically because Hyper-V/
+/// WSL/WinNAT port-exclusion ranges swallowed the dynamic range 49152-65535).
+/// Candidates live in 21309..=27772: below every default dynamic range, above
+/// common service ports, and away from the softkvm port. Binding explicitly
+/// bypasses the dynamic allocator entirely.
+pub const EXPLICIT_BIND_PORT_ATTEMPTS: u16 = 64;
+
+pub fn explicit_bind_candidate_port(index: u16) -> u16 {
+    let offset = (std::process::id() % 101) as u16;
+    21309 + offset + index * 101
+}
+
+fn explicit_bind_retryable(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::AddrInUse
+            | io::ErrorKind::AddrNotAvailable
+            | io::ErrorKind::PermissionDenied
+    )
+}
+
+/// Connect with an explicitly bound local port, scanning candidates. Used as
+/// a fallback when plain connect() cannot allocate an ephemeral port.
+pub async fn connect_via_explicit_local_bind(peer: &str) -> io::Result<TcpStream> {
+    let addr: SocketAddr = match peer.parse() {
+        Ok(addr) => addr,
+        Err(_) => lookup_host(peer).await?.next().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "peer resolved to nothing")
+        })?,
+    };
+
+    let mut last_error = None;
+    for index in 0..EXPLICIT_BIND_PORT_ATTEMPTS {
+        let port = explicit_bind_candidate_port(index);
+        let (socket, bind_addr): (TcpSocket, SocketAddr) = if addr.is_ipv4() {
+            (TcpSocket::new_v4()?, (Ipv4Addr::UNSPECIFIED, port).into())
+        } else {
+            (TcpSocket::new_v6()?, (Ipv6Addr::UNSPECIFIED, port).into())
+        };
+        if let Err(err) = socket.bind(bind_addr) {
+            last_error = Some(err);
+            continue;
+        }
+        match socket.connect(addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) if explicit_bind_retryable(err.kind()) => {
+                last_error = Some(err);
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::AddrInUse, "local bind scan exhausted")))
+}
+
+/// Bind a UDP socket on an ephemeral port, falling back to the explicit port
+/// scan when the dynamic allocator is broken (same 10048 failure mode).
+pub fn bind_udp_with_fallback() -> io::Result<std::net::UdpSocket> {
+    match std::net::UdpSocket::bind("0.0.0.0:0") {
+        Ok(socket) => Ok(socket),
+        Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+            for index in 0..EXPLICIT_BIND_PORT_ATTEMPTS {
+                let port = explicit_bind_candidate_port(index);
+                if let Ok(socket) = std::net::UdpSocket::bind(("0.0.0.0", port)) {
+                    warn!(
+                        port,
+                        "udp ephemeral allocation failed; bound explicit local port instead"
+                    );
+                    return Ok(socket);
+                }
+            }
+            Err(err)
+        }
+        Err(err) => Err(err),
+    }
+}
 
 pub async fn connect_tcp_with_retry(
     peer: &str,
@@ -36,19 +116,40 @@ pub async fn connect_tcp_with_retry(
                     raw_os_error = ?err.raw_os_error(),
                     "TCP connect failed"
                 );
-                if err.kind() == io::ErrorKind::AddrInUse && attempt == 1 {
+                if err.kind() == io::ErrorKind::AddrInUse {
                     // Outbound connect() failing with WSAEADDRINUSE/EADDRINUSE
-                    // means the OS could not allocate a local ephemeral port:
-                    // exhausted/shrunken dynamic range, port-exclusion ranges
-                    // (Hyper-V/WSL/Defender), or a duplicate instance storm.
-                    // Retrying rarely helps; diagnose instead.
-                    warn!(
-                        "local ephemeral port allocation failed (AddrInUse on outbound connect); \
-                         on Windows run scripts/diagnose-addrinuse.ps1: check \
-                         `netsh int ipv4 show dynamicport tcp`, \
-                         `netsh int ipv4 show excludedportrange tcp`, TIME_WAIT counts, \
-                         and duplicate softkvm processes"
-                    );
+                    // means the OS could not allocate a local ephemeral port
+                    // (excluded/shrunken dynamic range, TIME_WAIT exhaustion).
+                    // Bypass the allocator by binding a local port explicitly.
+                    match connect_via_explicit_local_bind(peer).await {
+                        Ok(stream) => {
+                            let local = stream
+                                .local_addr()
+                                .map(|addr| addr.to_string())
+                                .unwrap_or_else(|_| "unknown".to_owned());
+                            warn!(
+                                %peer,
+                                local,
+                                "ephemeral port allocation is broken on this machine; \
+                                 connected via explicit local bind. Run \
+                                 `softkvm.exe win-port-doctor --peer <mac-ip>:49321` \
+                                 to diagnose and fix the OS-level cause"
+                            );
+                            return Ok(stream);
+                        }
+                        Err(fallback_err) => {
+                            if attempt == 1 {
+                                warn!(
+                                    error = %fallback_err,
+                                    "explicit local bind fallback also failed; run \
+                                     `softkvm.exe win-port-doctor` (or \
+                                     scripts/diagnose-addrinuse.ps1) to check dynamicport, \
+                                     excludedportrange, TIME_WAIT counts, and duplicate \
+                                     softkvm processes"
+                                );
+                            }
+                        }
+                    }
                 }
                 last_error = Some(err);
                 if attempt < attempts {
@@ -203,6 +304,42 @@ mod tests {
 
         assert!(reader.read_frame().await?.is_none());
         sender.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_local_bind_connect_reaches_listener() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let peer = addr.to_string();
+
+        let (client, accepted) =
+            tokio::join!(connect_via_explicit_local_bind(&peer), listener.accept());
+        let client = client?;
+        let (_server, _) = accepted?;
+
+        let local_port = client.local_addr()?.port();
+        let in_scan_range = (0..EXPLICIT_BIND_PORT_ATTEMPTS)
+            .any(|index| explicit_bind_candidate_port(index) == local_port);
+        assert!(in_scan_range, "local port {local_port} not from scan range");
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_bind_candidates_stay_below_dynamic_range() {
+        for index in 0..EXPLICIT_BIND_PORT_ATTEMPTS {
+            let port = explicit_bind_candidate_port(index);
+            assert!(
+                (21309..28000).contains(&port),
+                "candidate {port} out of range"
+            );
+        }
+    }
+
+    #[test]
+    fn udp_fallback_binds() -> Result<()> {
+        let socket = bind_udp_with_fallback()?;
+        assert_ne!(socket.local_addr()?.port(), 0);
         Ok(())
     }
 

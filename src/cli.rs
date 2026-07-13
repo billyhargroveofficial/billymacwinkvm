@@ -89,6 +89,16 @@ pub enum Command {
         top: usize,
     },
 
+    /// Windows-only: diagnose outbound WSAEADDRINUSE 10048 (ephemeral-port
+    /// allocation failure) without needing PowerShell. Tests allocation,
+    /// prints netsh dynamicport/excludedportrange, counts dynamic-range
+    /// occupancy per process, and (with --peer) tries both connect paths.
+    WinPortDoctor {
+        /// Optional peer to test real outbound connects against.
+        #[arg(long)]
+        peer: Option<String>,
+    },
+
     /// Measure real Windows Raw Input cadence without involving macOS.
     WinRawCadence {
         #[arg(long, default_value_t = 60)]

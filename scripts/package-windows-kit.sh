@@ -118,10 +118,14 @@ mouse/USB side is exonerated:
 
 .\\softkvm.exe win-raw-cadence --seconds 120 --mode raw-only
 
-If 'probe' fails with os error 10048 (AddrInUse), that is a LOCAL ephemeral
-port problem, not the Mac refusing:
+If 'probe'/'host' logs os error 10048 (AddrInUse), that is a LOCAL ephemeral
+port problem, not the Mac refusing. The host now works around it by binding
+an explicit local port automatically (log: 'connected via explicit local
+bind'). To diagnose and fix the OS-level cause (no PowerShell needed):
 
-powershell -ExecutionPolicy Bypass -File .\\scripts\\diagnose-addrinuse.ps1
+.\\softkvm.exe win-port-doctor --peer "<mac-ip>:49321"
+
+PowerShell variant with Defender history: scripts\\diagnose-addrinuse.ps1
 EOF
 
 rm -f "$zip_path" "$latest_zip"
