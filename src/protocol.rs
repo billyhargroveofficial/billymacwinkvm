@@ -295,7 +295,7 @@ mod motion_tests {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub enum MacModifierPolicy {
     /// PC-keyboard physical order: Alt -> Command, Super -> Option.
     SwapAltSuper,
@@ -303,7 +303,7 @@ pub enum MacModifierPolicy {
     Native,
 }
 
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl MacModifierPolicy {
     pub fn from_env() -> Self {
         match std::env::var("SOFTKVM_MAC_MODIFIER_POLICY") {
@@ -328,7 +328,7 @@ impl MacModifierPolicy {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub enum MacModifier {
     Command,
     Option,

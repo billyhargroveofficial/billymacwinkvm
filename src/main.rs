@@ -1704,10 +1704,23 @@ async fn run_host(
         .await
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        platform::linux::run_host(
+            _peer,
+            _layout,
+            _activate_on_start,
+            _entry_x_ratio,
+            _entry_y_ratio,
+            _no_local_capture,
+        )
+        .await
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         bail!(
-            "host capture is Windows-only for the first MVP; use `probe` from macOS for client testing"
+            "host capture is Windows and Linux only; use `probe` from macOS for client testing"
         )
     }
 }

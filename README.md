@@ -1,23 +1,23 @@
 # billymacwinkvm
 
-Low-latency local software KVM experiment for Windows host -> macOS client.
+Low-latency local software KVM experiment for Windows/Linux host -> macOS client.
 
 Primary goal:
 
-- Windows machine on the right is the main host.
+- Windows or Linux machine on the right is the main host.
 - Mac display is on the left.
 - Mouse/keyboard should cross the screen edge.
 - `Ctrl+Alt+\` is the emergency/toggle hotkey.
 - While controlling macOS, Windows `Alt` maps to macOS `Command`, and Windows `Win/Super` maps to macOS `Option`.
 - macOS injection uses `cg-event`; the old external virtual-HID path was removed after it added visible activation lag.
-- Shared clipboard (text + images) syncs both ways, and each side shows a tray/menu-bar icon.
+- Shared clipboard (text + images) syncs both ways, and each side shows a tray/menu-bar icon (Linux host runs headless).
 
 ## Quick start (real two-machine setup)
 
-The Mac is the **client** (receives control); the Windows PC is the **host**
-(has the physical mouse/keyboard). Both machines must run the same kit version
-(v0019+ for clipboard). Start order does not matter — the host auto-connects
-and keeps retrying.
+The Mac is the **client** (receives control); the Windows PC or Linux box is
+the **host** (has the physical mouse/keyboard). Both machines must run the
+same kit version (v0019+ for clipboard). Start order does not matter — the
+host auto-connects and keeps retrying.
 
 Default port is `49321`. In the examples the Mac's LAN IP is `192.168.1.11`;
 replace it with your Mac's actual address (`ipconfig getifaddr en0` on the Mac).
@@ -62,6 +62,48 @@ Do **not** launch via the `.ps1` script unless you first run
 A softkvm icon appears in the system tray (right-click -> Quit); the tooltip
 shows `connected` / `connecting`.
 
+### 2-alt. Linux (host, Wayland/Hyprland)
+
+The Linux host captures input straight from evdev and tracks the cursor
+through Hyprland IPC (`.socket.sock`: `cursorpos`, `j/monitors`,
+`dispatch movecursor`). It needs:
+
+- membership in the `input` group: `sudo usermod -aG input $USER`, then log
+  out and back in (reading/grabbing `/dev/input/event*` is required);
+- `wl-clipboard` (`wl-copy`/`wl-paste`) for clipboard sync;
+- a Hyprland session for edge activation and cursor restore (without the IPC
+  socket only the `Ctrl+Alt+\` hotkey works).
+
+Then:
+
+```bash
+./scripts/linux-host.sh 192.168.1.11:49321
+# or directly:
+RUST_LOG=softkvm=info ./target/release/softkvm host --peer 192.168.1.11:49321 --layout mac-left
+```
+
+To keep it running across reboots (see `docs/linux-host.md` for why the unit
+goes through `sg input`):
+
+```bash
+cp systemd/softkvm-host.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now softkvm-host
+journalctl --user -u softkvm-host -f
+```
+
+There is no tray icon on Linux; status goes to the log. Behavior notes:
+
+- While the Mac is controlled, the captured devices are grabbed
+  (`EVIOCGRAB`), so the local cursor stays parked at the left screen edge.
+  When control returns, the cursor is warped back via `movecursor`.
+- Keyboards already grabbed by another remapper (e.g. an hk-translator-style
+  evdev/uinput tool) are not grabbed again — their events arrive through the
+  remapper's virtual devices, which softkvm grabs instead.
+- The `Ctrl+Alt+\` hotkey pressed while control is **local** cannot be
+  swallowed (devices are only grabbed during remote control), so the focused
+  window may also see the keypress.
+
 ### 3. Use it
 
 - Move the cursor into the **left screen edge** on Windows to cross onto the Mac;
@@ -79,6 +121,8 @@ shows `connected` / `connecting`.
 | `SOFTKVM_TRACE=1` | enable freeze tracing (see `docs/freeze-tracing-guide.md`) |
 | `SOFTKVM_MOTION_TRANSPORT=tcp` | fall back to TCP/JSON motion instead of UDP |
 | `SOFTKVM_RAW_INPUT_READER=lparam` | use `GetRawInputData` instead of the buffered reader |
+| `SOFTKVM_MAC_SCROLL_MODE=line` | post line-unit wheel events instead of pixel units (default `pixel`: Qt apps such as Telegram ignore synthetic line-unit scrolling) |
+| `SOFTKVM_MAC_SCROLL_PIXELS=32` | pixels per wheel notch in pixel mode |
 
 ### Windows won't connect? (`os error 10048 / AddrInUse`)
 
@@ -151,5 +195,8 @@ SOFTKVM_LATENCY_LOG=1 RUST_LOG=softkvm=info,softkvm::latency=info ./scripts/mac-
 
 - `docs/architecture.md`
 - `docs/windows-host.md`
+- `docs/linux-host.md` — threading model, the 5 s rescan freeze, the macOS
+  Accessibility trap, running as a service
 - `docs/dev-setup.md`
 - `docs/test-plan.md`
+- `docs/freeze-tracing-guide.md` — the AWDL diagnosis and the tracing toolkit

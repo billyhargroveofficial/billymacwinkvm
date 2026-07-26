@@ -1,0 +1,19 @@
+[Unit]
+Description=softkvm Linux host (evdev/Hyprland capture -> macOS client)
+Documentation=file://%h/billymacwinkvm/README.md
+
+[Service]
+# Peer = the Mac running the softkvm client. Override with:
+#   systemctl --user edit softkvm-host  ->  [Service] Environment=SOFTKVM_PEER=ip:port
+Environment=SOFTKVM_PEER=192.168.1.6:49321
+Environment=RUST_LOG=softkvm=info
+# `sg input` because the per-user systemd manager keeps the group set it was
+# started with, and with Linger=yes it survives logout: adding yourself to
+# `input` does not reach it until the next reboot. Reading /dev/input needs
+# that group, so take it explicitly instead of depending on the manager's.
+ExecStart=/usr/bin/sg input -c "exec %h/billymacwinkvm/target/release/softkvm host --peer ${SOFTKVM_PEER} --layout mac-left"
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

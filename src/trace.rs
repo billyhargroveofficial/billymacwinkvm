@@ -42,6 +42,10 @@ pub enum Stage {
     MacPostPre = 15,
     MacPostPost = 16,
     MacObserved = 17,
+    // Linux host stages.
+    LnxEvdevIn = 20,
+    LnxUdpPre = 21,
+    LnxUdpPost = 22,
     // Session markers and synthetic sources.
     ActiveOn = 30,
     ActiveOff = 31,
@@ -63,6 +67,9 @@ impl Stage {
             15 => "mac_post_pre",
             16 => "mac_post_post",
             17 => "mac_observed",
+            20 => "lnx_evdev_in",
+            21 => "lnx_udp_pre",
+            22 => "lnx_udp_post",
             30 => "active_on",
             31 => "active_off",
             40 => "bench_tick",

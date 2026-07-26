@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.softkvm.client</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/billy/billymacwinkvm/target/release/softkvm</string>
+        <string>client</string>
+        <string>--listen</string>
+        <string>0.0.0.0:49321</string>
+        <string>--sink</string>
+        <string>cg-event</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/billy/billymacwinkvm</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>softkvm=info</string>
+        <key>SOFTKVM_TRAY</key>
+        <string>0</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/softkvm-client.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/softkvm-client.log</string>
+</dict>
+</plist>
