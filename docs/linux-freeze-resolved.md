@@ -93,12 +93,21 @@ after (as a service, 60 s, softkvm + Hyprland sampled together)
 `scripts/linux-d-state-sample.py` is that sampler.
 
 Note on attribution: `/proc/<pid>/task/<tid>/wchan`, `.../syscall` and
-`.../stack` all require `PTRACE_MODE_READ`, and with
-`kernel.yama.ptrace_scope=1` a process that is not an ancestor cannot read
-them — they come back as `0` / empty even for your own uid. The state letter
-in `stat` is not gated, which is why the sampler leans on it. `stat`'s
-`majflt` and `delayacct_blkio_ticks` are not gated either, and they are enough
-to rule out the two most common causes of `D` (see below).
+`.../stack` all require `PTRACE_MODE_READ`, and against the *service* they
+come back as `0` / empty even for your own uid. The cause is not yama — a
+plain sibling process reads back a healthy `wchan` (`hrtimer_nanosleep` for a
+`sleep`) under the same `kernel.yama.ptrace_scope=1`. It is that the unit
+launches through `sg`, which is setgid: exec'ing a setgid binary clears the
+process's dumpable flag, and a non-dumpable process restricts `environ`,
+`wchan`, `syscall` and `stack` to root. `environ` denied for your own process
+is the tell.
+
+So the sampler leans on the state letter in `stat`, which is never gated, plus
+`majflt` and `delayacct_blkio_ticks` from the same file — enough to rule out
+the two most common causes of `D`. **To read `wchan` instead, run the host
+from a normal shell rather than the unit** (`./target/release/softkvm host
+--peer …`, in a shell that already has the `input` group), and the gated files
+come back.
 
 ## Why a parked worker reaches the Mac
 
@@ -143,9 +152,13 @@ are not disk and not paging — the process reports `delayacct_blkio_ticks = 0`
 and `majflt = 0` since start — which leaves a wait inside a driver or on a
 kernel mutex. Grabbing ten evdev devices at once on every transition is the
 obvious suspect (`input_grab_device` takes `dev->mutex`, and `mutex_lock` in
-the kernel sleeps uninterruptibly), but confirming that needs the ptrace-gated
-files above, i.e. root, and the transitions themselves measure 0.15 ms
-host-side and drew no complaint. Left as an observation, not a fix.
+the kernel sleeps uninterruptibly), but the transitions measure 0.15 ms
+host-side and drew no complaint, so this is an observation, not a fix.
+
+Confirming it is cheap when someone wants to: stop the unit, run the host from
+a shell that has the `input` group so it is not launched through setgid `sg`,
+and sample again — `wchan` is then readable and will name the function each
+worker is parked in.
 
 If a hitch ever becomes noticeable *at the moment of crossing*, run a traced
 session — `SOFTKVM_TRACE=1` on both machines, `softkvm trace-analyze` — per

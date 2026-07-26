@@ -83,6 +83,30 @@ A stable self-signed certificate would survive rebuilds, but importing and
 trusting one needs an interactive session — `security import` and
 `add-trusted-cert` both fail over ssh with "User interaction is not allowed".
 
+## Does it come back after a reboot?
+
+**Linux: yes, unattended.** The user unit is enabled (symlinked into
+`default.target.wants`) and the account has `Linger=yes`, so the per-user
+systemd manager starts at boot and pulls the host in without anyone logging
+in. It does not inherit `HYPRLAND_INSTANCE_SIGNATURE`, and at boot it starts
+before Hyprland exists — that is fine: the socket is resolved by picking the
+most recently touched instance directory under `$XDG_RUNTIME_DIR/hypr`, and a
+failed resolve is retried every 5 s, so edge activation starts working as soon
+as the compositor is up. Until then only the `Ctrl+Alt+\` hotkey works, which
+also means the hotkey can hand control to the Mac from the login screen.
+
+**Mac: yes, but only after someone logs in.** `com.softkvm.client` is a
+LaunchAgent in `~/Library/LaunchAgents` with `RunAtLoad` and `KeepAlive`, so
+it starts with the GUI session and is restarted if it dies — but a LaunchAgent
+has no session to run in until the desktop is logged in, and this Mac has no
+auto-login configured (FileVault is off, so at least the boot stops at the
+ordinary login window). Reboot the Mac and the KVM stays dead until the
+desktop session exists. Enable auto-login if that matters; ssh alone does not
+bring the agent up.
+
+The Accessibility grant survives reboots — it is only invalidated by
+rebuilding the binary.
+
 ## Running as a service
 
 `systemd/softkvm-host.service` is a user unit:

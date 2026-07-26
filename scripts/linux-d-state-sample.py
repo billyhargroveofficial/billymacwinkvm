@@ -3,9 +3,11 @@
 
 This is the tool that found the 5 s cursor freeze described in
 docs/linux-freeze-resolved.md. It leans on /proc/<pid>/task/*/stat because the
-state letter there is readable without privilege, while wchan / syscall /
-stack all require PTRACE_MODE_READ and come back empty under
-kernel.yama.ptrace_scope=1 for a process you did not spawn.
+state letter there is readable whatever the target is, while wchan / syscall /
+stack need PTRACE_MODE_READ. Against the systemd unit those come back empty:
+it launches through setgid `sg`, which makes the process non-dumpable and
+restricts them to root. Run the host from a shell that already has the `input`
+group if you need wchan to name the function a thread is parked in.
 
     # thread states of the running host
     python3 scripts/linux-d-state-sample.py $(pgrep -x softkvm) 20
