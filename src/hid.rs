@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 use tracing::info;
 #[cfg(target_os = "macos")]
+use tracing::error;
+#[cfg(target_os = "macos")]
 use tracing::trace;
 #[cfg(target_os = "macos")]
 use tracing::warn;
@@ -160,6 +162,7 @@ impl CgEventSink {
             scroll_inverted = true,
             "using CGEvent mouse and keyboard sink"
         );
+        warn_if_not_trusted();
         Ok(Self {
             buttons: 0,
             modifiers: 0,
@@ -396,8 +399,21 @@ impl CgEventSink {
     fn post_wheel(&self, dx: i32, dy: i32) -> Result<()> {
         let dx = -dx;
         let dy = -dy;
+        // Pixel-unit scrolling: Qt apps on macOS (Telegram etc.) ignore
+        // synthetic line-unit wheel events; pixel units work everywhere.
+        let (unit, axis1, axis2) = match mac_scroll_mode() {
+            MacScrollMode::Line => (CG_SCROLL_EVENT_UNIT_LINE, dy, dx),
+            MacScrollMode::Pixel => {
+                let scale = i64::from(mac_scroll_pixel_scale());
+                (
+                    CG_SCROLL_EVENT_UNIT_PIXEL,
+                    (i64::from(dy) * scale) as i32,
+                    (i64::from(dx) * scale) as i32,
+                )
+            }
+        };
         let event = unsafe {
-            CGEventCreateScrollWheelEvent(std::ptr::null(), CG_SCROLL_EVENT_UNIT_LINE, 2, dy, dx, 0)
+            CGEventCreateScrollWheelEvent(std::ptr::null(), unit, 2, axis1, axis2, 0)
         };
         if event.is_null() {
             bail!("CGEventCreateScrollWheelEvent returned null");
@@ -798,6 +814,8 @@ const CG_MOUSE_EVENT_DELTA_X: u32 = 4;
 #[cfg(target_os = "macos")]
 const CG_MOUSE_EVENT_DELTA_Y: u32 = 5;
 #[cfg(target_os = "macos")]
+const CG_SCROLL_EVENT_UNIT_PIXEL: u32 = 0;
+#[cfg(target_os = "macos")]
 const CG_SCROLL_EVENT_UNIT_LINE: u32 = 1;
 #[cfg(target_os = "macos")]
 const CG_EVENT_FLAG_MASK_SHIFT: u64 = 0x0002_0000;
@@ -840,6 +858,30 @@ unsafe extern "C" {
     fn CGSetLocalEventsSuppressionInterval(seconds: f64);
     fn CGEventPost(tap: u32, event: *mut std::ffi::c_void);
     fn CFRelease(cf: *const std::ffi::c_void);
+    fn AXIsProcessTrusted() -> u8;
+}
+
+/// Without the Accessibility grant `CGEventPost` is dropped on the floor with
+/// no error of any kind, which looks exactly like a dead network path. The
+/// grant is bound to the binary's code signature, so every `cargo build`
+/// invalidates it — worth saying out loud at startup rather than debugging the
+/// wire again.
+#[cfg(target_os = "macos")]
+fn warn_if_not_trusted() {
+    if unsafe { AXIsProcessTrusted() } != 0 {
+        info!("macOS Accessibility permission present");
+        return;
+    }
+    let binary = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "?".to_owned());
+    error!(
+        %binary,
+        "macOS Accessibility permission MISSING: injected events will be silently ignored \
+         and the cursor will not move. Rebuilding invalidates the grant, so re-add it in \
+         System Settings -> Privacy & Security -> Accessibility: remove the old softkvm \
+         entry, press '+', and pick this exact binary."
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -879,6 +921,44 @@ fn mac_modifier_bit(modifier: MacModifier) -> u8 {
         MacModifier::Option => 0x04,
         MacModifier::Command => 0x08,
     }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MacScrollMode {
+    Line,
+    Pixel,
+}
+
+#[cfg(target_os = "macos")]
+fn mac_scroll_mode() -> MacScrollMode {
+    static MODE: std::sync::OnceLock<MacScrollMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("SOFTKVM_MAC_SCROLL_MODE")
+            .unwrap_or_else(|_| "pixel".to_owned())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "line" | "lines" => MacScrollMode::Line,
+            "pixel" | "pixels" => MacScrollMode::Pixel,
+            other => {
+                warn!(value = other, "unknown SOFTKVM_MAC_SCROLL_MODE; using pixel");
+                MacScrollMode::Pixel
+            }
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn mac_scroll_pixel_scale() -> i32 {
+    static SCALE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("SOFTKVM_MAC_SCROLL_PIXELS")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(32)
+            .clamp(1, 512)
+    })
 }
 
 #[cfg(target_os = "macos")]
