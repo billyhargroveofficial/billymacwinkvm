@@ -43,6 +43,10 @@ A `⌘⇄` icon appears in the menu bar (Quit from there). macOS will prompt for
 injection works. `--listen 0.0.0.0:49321` is required so the Windows host can
 reach it over the LAN (not `127.0.0.1`).
 
+Every later rebuild of this binary revokes that permission again, silently —
+when the Mac stops responding, see
+[The Mac stopped responding?](#the-mac-stopped-responding-accessibility-fell-off).
+
 ### 2. Windows (host)
 
 Unzip the latest kit (`dist/softkvm-windows-test-kit-latest.zip`) and, in
@@ -132,6 +136,48 @@ OS-level cause with:
 
 ```powershell
 .\softkvm.exe win-port-doctor --peer 192.168.1.11:49321
+```
+
+### The Mac stopped responding? (Accessibility fell off)
+
+Control crosses the edge, the host log looks perfectly healthy, and nothing
+moves on the Mac. Two causes, and the log says which:
+
+```bash
+tail -20 /tmp/softkvm-client.log
+```
+
+**`Accessibility permission MISSING`** — macOS ties the grant to the binary's
+code signature and the client is signed ad-hoc, so **every rebuild of the Mac
+client silently revokes it**. `CGEventPost` keeps returning success while
+nothing moves. Toggling the existing switch off and on is not enough: the
+entry still points at the old signature, it has to be removed and re-added.
+
+On the Mac itself (this needs the physical machine — the panel cannot be
+driven over ssh):
+
+1.  Open **System Settings → Privacy & Security → Accessibility**.
+2.  Select the old **softkvm** row and press **−** to remove it. Authenticate
+    with Touch ID or your password when asked.
+3.  Press **+**. In the file picker press **⇧⌘G**, paste
+    `/Users/billy/billymacwinkvm/target/release/` and pick **softkvm**.
+4.  Make sure the new row's toggle is **on**.
+
+Then restart the client so it re-reads its permissions — TCC state is cached
+per process, so this step is not optional. Over ssh is fine:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.softkvm.client
+tail -5 /tmp/softkvm-client.log     # expect: "macOS Accessibility permission present"
+```
+
+**No log, or no process at all** — the client is not running. It is a
+LaunchAgent, so it only exists inside a logged-in desktop session: after a
+reboot it stays down until someone logs into the Mac, and ssh alone will not
+bring it up. Once a session exists:
+
+```bash
+pgrep -fl softkvm || launchctl kickstart -k gui/$(id -u)/com.softkvm.client
 ```
 
 ## Current Status
