@@ -1,4 +1,4 @@
-# Linux host (Wayland/Hyprland): threading model and the 5 s freeze
+# Linux host (Wayland/Hyprland): threading model and traps
 
 The Linux host mirrors the Windows one: physical input is captured locally,
 motion goes out as binary UDP, everything else as length-prefixed JSON over
@@ -18,46 +18,22 @@ calls — and that layer is where the host's own freeze lived.
 The two runtime workers carry the actual motion path, so anything that parks
 one of them for longer than a frame is visible on the Mac as a cursor stall.
 
-## The freeze: rescanning /dev/input in the hot path
+## Why discovery looks the way it does
 
-Symptom: the Mac cursor hitched every few seconds while the Linux host drove
-it. Movement between hitches was smooth, so it was never a rate problem.
+Device discovery never calls `evdev::enumerate()`, and the rule is: **open a
+node at most once per process lifetime, and never from a thread that forwards
+input.** `enumerate()` opens every node under `/dev/input` before the caller
+can filter anything, and a full sweep of this machine's 27 nodes costs 300-500
+ms of uninterruptible time, because the audio jack-detect and HDMI-audio nodes
+wake their codec on open. Running that on a timer inside the runtime is what
+froze the Mac cursor every 5 seconds — the whole story, with the measurements
+and how to repeat them, is in `docs/linux-freeze-resolved.md`.
 
-Root cause: device discovery called `evdev::enumerate()` on a Tokio task every
-5 seconds. `enumerate()` **opens every node** under `/dev/input` before the
-caller can filter anything, and on this machine that is not cheap:
-
-```text
-27 nodes, 12 sweeps:  sweep 386 / 438 / 505 ms  (min / p50 / max)
-worst single nodes:   ~36 ms  HD-Audio Generic Line Out Front
-                      ~35 ms  HDA NVidia HDMI/DP,pcm=3
-                      ~30 ms  PC Speaker
-```
-
-The expensive nodes are HD-Audio jack-detect and NVIDIA HDMI-audio inputs:
-opening one wakes its codec, which is a real bus transaction, uninterruptible.
-Sampling every thread of the running host through `/proc/<pid>/task/*/stat`
-caught it directly:
-
-```text
-before:  524 D-state samples in 14 s, longest uninterruptible window 390 ms
-         (all of them on a softkvm-runtime worker, recurring on the 5 s grid)
-after:   0 in 20 s; 0 episodes >= 15 ms in 60 s
-```
-
-The same pathology, on the same machine, previously froze this user's keyboard
-daemons — a periodic full rescan of `/dev/input` from a thread that also
-forwards input is simply not viable here.
-
-Fix, in `device_scan_thread`:
-
-- discovery is a `read_dir` of `/dev/input` — dirents only, nothing is opened;
-- each path is opened **at most once** and its verdict cached (captured /
-  ignored); a path only gets reconsidered when it disappears from the
-  directory, or when its reader task ends (unplug, read error), which the task
-  reports back over a channel;
-- the whole loop lives on its own OS thread, so even the one-time startup
-  sweep never touches a runtime worker.
+So `device_scan_thread` lists the directory (dirents only, nothing opened),
+opens only paths it has not judged before, caches the verdict, and re-judges a
+path only when it vanishes from the directory or its reader task ends. Open
+*failures* are not cached — a node can appear before udev has applied its
+permissions.
 
 Opening a node that another process has grabbed is fine; grabbing it is not,
 which is why `EVIOCGRAB` failures with `EBUSY` are logged and ignored (a
@@ -76,16 +52,8 @@ its own thread rather than parking a runtime worker for it.
 The `~0.5 s` freeze investigated during the Windows era was never a softkvm
 bug: the Mac's Wi-Fi radio tunes away from the infrastructure channel every
 512 TU = 524.288 ms to service AWDL (AirDrop / Handoff / Universal Control).
-See `docs/freeze-tracing-guide.md` for the evidence and the A/B script.
-
-Re-measured from the Mac on 2026-07-26, 600 pings to the gateway:
-
-```text
-today:      p50 3.50  p99 13.31  max 17.66 ms, 0 % loss,
-            3 spikes >= 15 ms in 60 s, no 524 ms structure
-2026-07-13: p50 3.4 ms but 9.9 % of replies at 20-91 ms,
-            all inter-spike gaps multiples of ~0.5 s
-```
+See `docs/freeze-tracing-guide.md` for the evidence and the A/B script, and
+`docs/linux-freeze-resolved.md` for why the 5 s freeze was not this.
 
 So `awdl0` is up but idle right now — nothing is driving an availability
 window. If the periodic-on-a-half-second stall ever comes back, that is the

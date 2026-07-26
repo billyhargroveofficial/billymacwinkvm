@@ -195,8 +195,10 @@ SOFTKVM_LATENCY_LOG=1 RUST_LOG=softkvm=info,softkvm::latency=info ./scripts/mac-
 
 - `docs/architecture.md`
 - `docs/windows-host.md`
-- `docs/linux-host.md` — threading model, the 5 s rescan freeze, the macOS
-  Accessibility trap, running as a service
+- `docs/linux-host.md` — threading model, the macOS Accessibility trap,
+  running as a service
+- `docs/linux-freeze-resolved.md` — the 5 s cursor freeze: measurements, root
+  cause, fix, and how to re-run the measurements
 - `docs/dev-setup.md`
 - `docs/test-plan.md`
 - `docs/freeze-tracing-guide.md` — the AWDL diagnosis and the tracing toolkit
