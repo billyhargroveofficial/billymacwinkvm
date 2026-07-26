@@ -126,7 +126,20 @@ There is no tray icon on Linux; status goes to the log. Behavior notes:
 | `SOFTKVM_MOTION_TRANSPORT=tcp` | fall back to TCP/JSON motion instead of UDP |
 | `SOFTKVM_RAW_INPUT_READER=lparam` | use `GetRawInputData` instead of the buffered reader |
 | `SOFTKVM_MAC_SCROLL_MODE=line` | post line-unit wheel events instead of pixel units (default `pixel`: Qt apps such as Telegram ignore synthetic line-unit scrolling) |
-| `SOFTKVM_MAC_SCROLL_PIXELS=32` | pixels per wheel notch in pixel mode |
+| `SOFTKVM_MAC_SCROLL_PIXELS=32` | pixels per wheel notch in pixel mode; the shipped LaunchAgent raises it to 64, because injected scroll gets none of the acceleration macOS applies to a real wheel |
+
+To retune the scroll step on a Mac running the LaunchAgent, edit the value and
+**re-bootstrap** — `kickstart` restarts the process but launchd keeps the job
+definition it already read, so the new value would not reach it:
+
+```bash
+P=~/Library/LaunchAgents/com.softkvm.client.plist
+/usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:SOFTKVM_MAC_SCROLL_PIXELS 96" "$P"
+launchctl bootout gui/$(id -u)/com.softkvm.client; launchctl bootstrap gui/$(id -u) "$P"
+ps eww -p "$(pgrep -x softkvm)" | tr ' ' '\n' | grep SOFTKVM   # confirm it took
+```
+
+No rebuild is involved, so the Accessibility grant is unaffected.
 
 ### Windows won't connect? (`os error 10048 / AddrInUse`)
 

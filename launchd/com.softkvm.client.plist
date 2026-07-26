@@ -21,6 +21,13 @@
         <string>softkvm=info</string>
         <key>SOFTKVM_TRAY</key>
         <string>0</string>
+        <!-- Pixels per wheel notch. The built-in default of 32 reads as
+             sluggish next to a native wheel, which macOS also accelerates
+             with scroll speed while injected events get no acceleration at
+             all. Changing this needs a re-bootstrap, not a kickstart, but it
+             does not touch the binary, so the Accessibility grant survives. -->
+        <key>SOFTKVM_MAC_SCROLL_PIXELS</key>
+        <string>64</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
